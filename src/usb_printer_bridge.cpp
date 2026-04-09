@@ -466,17 +466,16 @@ void usb_client_task(void *arg) {
     if (g_state.new_device_pending) {
       should_open = true;
       device_address = g_state.pending_device_address;
-      g_state.new_device_pending = false;
     }
     if (g_state.device_gone_pending) {
       should_close = true;
     }
     xSemaphoreGive(g_state.state_mutex);
 
-    if (should_open) {
-      handle_new_device(device_address);
-    }
-
+    // Handle close BEFORE open so a departing device is torn down before a
+    // newly-attached one is opened.  If the close cannot proceed right now
+    // (send_mutex held by an active transfer) defer the open as well —
+    // the pending flags stay set and will be retried next iteration.
     if (should_close) {
       if (xSemaphoreTake(g_state.send_mutex, 0) == pdTRUE) {
         Serial.println("[USB] Device gone event received");
@@ -485,7 +484,16 @@ void usb_client_task(void *arg) {
         g_state.device_gone_pending = false;
         xSemaphoreGive(g_state.state_mutex);
         xSemaphoreGive(g_state.send_mutex);
+      } else {
+        should_open = false;
       }
+    }
+
+    if (should_open) {
+      handle_new_device(device_address);
+      xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+      g_state.new_device_pending = false;
+      xSemaphoreGive(g_state.state_mutex);
     }
   }
 }
@@ -675,8 +683,11 @@ bool send_raw(const uint8_t *data, size_t length) {
   xSemaphoreTake(g_state.send_mutex, portMAX_DELAY);
   bool ok = true;
   size_t offset = 0;
-  const size_t maxChunk =
+  size_t maxChunk =
       g_state.out_endpoint_mps > 0 ? g_state.out_endpoint_mps : kTransferBufferSize;
+  if (maxChunk > kTransferBufferSize) {
+    maxChunk = kTransferBufferSize;
+  }
   while (offset < length) {
     const size_t chunk = min(maxChunk, length - offset);
     if (!submit_transfer_locked(data + offset, chunk)) {
