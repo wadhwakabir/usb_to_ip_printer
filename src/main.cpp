@@ -5,6 +5,9 @@
 #include <ctype.h>
 extern "C" {
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 }
 
 #include "network_config.h"
@@ -30,6 +33,8 @@ constexpr uint32_t kPrintIdleTimeoutMs = 30000;
 constexpr uint32_t kChunkBufferSize = 512;
 constexpr size_t kDebugCommandMax = 96;
 constexpr size_t kDebugBytesPerPoll = 64;
+constexpr size_t kPrintBufferCapacity = 128 * 1024;  // 128KB read-ahead buffer
+constexpr uint32_t kBufferFlushTimeoutMs = 30000;
 
 enum class DeviceState {
   Booting,
@@ -50,6 +55,19 @@ struct JobStats {
   uint32_t startedAtMs = 0;
   uint32_t lastDataAtMs = 0;
 } jobStats;
+
+struct PrintRingBuffer {
+  uint8_t *storage = nullptr;
+  size_t capacity = 0;
+  size_t head = 0;
+  size_t tail = 0;
+  SemaphoreHandle_t mutex = nullptr;
+  SemaphoreHandle_t data_ready = nullptr;
+  TaskHandle_t drain_task = nullptr;
+  volatile bool drain_error = false;
+  volatile bool job_active = false;
+  volatile uint32_t job_generation = 0;
+} printBuf;
 
 DeviceState currentState = DeviceState::Booting;
 WiFiServer printServer(kRawPrintPort);
@@ -239,7 +257,8 @@ bool connectToWifiStation() {
   }
 
   startedAsAccessPoint = false;
-  Serial.println("[WIFI] Connected to station network");
+  WiFi.setAutoReconnect(true);
+  Serial.println("[WIFI] Connected to station network (auto-reconnect enabled)");
   return true;
 }
 
@@ -270,7 +289,133 @@ void startDebugServer() {
                 kDebugPort);
 }
 
+// --- Print read-ahead buffer: decouples TCP receive from USB send ---
+// The main loop writes TCP data in, a FreeRTOS drain task sends it to USB.
+// This eliminates printer starvation caused by network round-trip latency.
+
+size_t bufferUsedLocked() {
+  return (printBuf.head >= printBuf.tail)
+             ? (printBuf.head - printBuf.tail)
+             : (printBuf.capacity - printBuf.tail + printBuf.head);
+}
+
+size_t bufferFreeLocked() {
+  return printBuf.capacity - 1 - bufferUsedLocked();
+}
+
+size_t bufferWrite(const uint8_t *data, size_t len) {
+  xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+  const size_t free = bufferFreeLocked();
+  const size_t n = min(len, free);
+  if (n > 0) {
+    const size_t first = min(n, printBuf.capacity - printBuf.head);
+    memcpy(printBuf.storage + printBuf.head, data, first);
+    if (n > first) {
+      memcpy(printBuf.storage, data + first, n - first);
+    }
+    printBuf.head = (printBuf.head + n) % printBuf.capacity;
+  }
+  xSemaphoreGive(printBuf.mutex);
+  if (n > 0) {
+    xSemaphoreGive(printBuf.data_ready);
+  }
+  return n;
+}
+
+size_t bufferRead(uint8_t *data, size_t maxLen) {
+  xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+  const size_t used = bufferUsedLocked();
+  const size_t n = min(maxLen, used);
+  if (n > 0) {
+    const size_t first = min(n, printBuf.capacity - printBuf.tail);
+    memcpy(data, printBuf.storage + printBuf.tail, first);
+    if (n > first) {
+      memcpy(data + first, printBuf.storage, n - first);
+    }
+    printBuf.tail = (printBuf.tail + n) % printBuf.capacity;
+  }
+  xSemaphoreGive(printBuf.mutex);
+  return n;
+}
+
+void bufferReset() {
+  xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+  printBuf.head = 0;
+  printBuf.tail = 0;
+  printBuf.drain_error = false;
+  xSemaphoreGive(printBuf.mutex);
+  xSemaphoreTake(printBuf.data_ready, 0);
+}
+
+size_t bufferUsed() {
+  xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+  const size_t used = bufferUsedLocked();
+  xSemaphoreGive(printBuf.mutex);
+  return used;
+}
+
+bool initPrintBuffer() {
+  printBuf.storage = static_cast<uint8_t *>(ps_malloc(kPrintBufferCapacity));
+  if (printBuf.storage == nullptr) {
+    printBuf.storage = static_cast<uint8_t *>(malloc(kPrintBufferCapacity));
+  }
+  if (printBuf.storage == nullptr) {
+    return false;
+  }
+  printBuf.capacity = kPrintBufferCapacity;
+  printBuf.mutex = xSemaphoreCreateMutex();
+  printBuf.data_ready = xSemaphoreCreateBinary();
+  return printBuf.mutex != nullptr && printBuf.data_ready != nullptr;
+}
+
+void printBufferDrainTask(void *) {
+  uint8_t chunk[kChunkBufferSize];
+  for (;;) {
+    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(50));
+    const uint32_t gen = printBuf.job_generation;
+    while (printBuf.job_active && !printBuf.drain_error) {
+      const size_t n = bufferRead(chunk, sizeof(chunk));
+      if (n == 0) {
+        break;
+      }
+      if (!usb_printer_bridge::send_raw(chunk, n)) {
+        // Only report error if still the same job — a stale failure from
+        // a previous job must not poison the next one.
+        if (printBuf.job_generation == gen) {
+          printBuf.drain_error = true;
+          Serial.printf("[BUFFER] USB drain failed: %s\n",
+                        usb_printer_bridge::last_error());
+        }
+      }
+    }
+  }
+}
+
+void flushPrintBuffer() {
+  const uint32_t start = millis();
+  while (millis() - start < kBufferFlushTimeoutMs) {
+    if (printBuf.drain_error) {
+      break;
+    }
+    const size_t remaining = bufferUsed();
+    if (remaining == 0) {
+      break;
+    }
+    xSemaphoreGive(printBuf.data_ready);
+    delay(10);
+  }
+  const size_t leftover = bufferUsed();
+  if (leftover > 0) {
+    Serial.printf("[BUFFER] Flush ended with %u bytes undelivered\n",
+                  static_cast<unsigned>(leftover));
+  }
+}
+
 void beginJob(WiFiClient &client) {
+  bufferReset();
+  printBuf.job_generation++;
+  printBuf.job_active = true;
+
   jobStats.active = true;
   jobStats.bytesReceived = 0;
   jobStats.chunksReceived = 0;
@@ -288,6 +433,12 @@ void finishJob(const char *reason, bool markComplete = true) {
     return;
   }
 
+  if (markComplete && !printBuf.drain_error) {
+    flushPrintBuffer();
+  }
+  printBuf.job_active = false;
+  bufferReset();
+
   const uint32_t elapsed = millis() - jobStats.startedAtMs;
   Serial.printf("[JOB] Finished (%s): %u bytes in %u chunks over %lu ms\n",
                 reason, static_cast<unsigned>(jobStats.bytesReceived),
@@ -301,13 +452,28 @@ void finishJob(const char *reason, bool markComplete = true) {
   }
 }
 
-bool deliverPrintData(const uint8_t *data, size_t length) {
-  return usb_printer_bridge::send_raw(data, length);
-}
-
 void pollForClients() {
   if (!activeClient || !activeClient.connected()) {
     if (jobStats.active) {
+      // Drain any residual TCP data into the ring buffer before finishing.
+      // connected() usually stays true while available()>0, but a safety
+      // drain here closes edge cases around simultaneous data+FIN arrival.
+      // Check free space BEFORE reading so we never pull bytes from TCP
+      // that we cannot store.
+      if (activeClient) {
+        uint8_t residual[kChunkBufferSize];
+        while (activeClient.available() > 0) {
+          xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+          const size_t free = bufferFreeLocked();
+          xSemaphoreGive(printBuf.mutex);
+          if (free == 0) break;
+          const size_t toRead = min(sizeof(residual), free);
+          const int n = activeClient.read(residual, toRead);
+          if (n <= 0) break;
+          bufferWrite(residual, static_cast<size_t>(n));
+          jobStats.bytesReceived += static_cast<size_t>(n);
+        }
+      }
       finishJob("client disconnected", jobStats.bytesReceived > 0);
     }
 
@@ -341,23 +507,36 @@ void processPrintStream() {
     return;
   }
 
+  // Check if the drain task hit a USB error
+  if (printBuf.drain_error) {
+    Serial.printf("[ERROR] Buffer drain failed: %s\n",
+                  usb_printer_bridge::last_error());
+    setState(DeviceState::Error);
+    activeClient.stop();
+    finishJob("buffer drain failed", false);
+    return;
+  }
+
   uint8_t buffer[kChunkBufferSize];
   bool sawPayload = false;
 
   while (activeClient.available() > 0) {
-    const int bytesRead = activeClient.read(buffer, sizeof(buffer));
+    // Check how much buffer space is free before reading from TCP
+    xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+    const size_t free = bufferFreeLocked();
+    xSemaphoreGive(printBuf.mutex);
+
+    if (free == 0) {
+      break;  // Buffer full, let drain task catch up
+    }
+
+    const size_t toRead = min(sizeof(buffer), free);
+    const int bytesRead = activeClient.read(buffer, toRead);
     if (bytesRead <= 0) {
       break;
     }
 
-    if (!deliverPrintData(buffer, static_cast<size_t>(bytesRead))) {
-      Serial.printf("[ERROR] Printer handoff failed: %s\n",
-                    usb_printer_bridge::last_error());
-      setState(DeviceState::Error);
-      activeClient.stop();
-      finishJob("printer handoff failed", false);
-      return;
-    }
+    bufferWrite(buffer, static_cast<size_t>(bytesRead));
 
     sawPayload = true;
     jobStats.bytesReceived += static_cast<size_t>(bytesRead);
@@ -372,8 +551,10 @@ void processPrintStream() {
     setState(DeviceState::Printing);
 
     if (millis() - lastProgressLogAtMs > 1000) {
-      Serial.printf("[JOB] Progress: %u bytes in %u chunks\n",
+      const size_t buffered = bufferUsed();
+      Serial.printf("[JOB] Progress: %u bytes received, %u buffered, %u chunks\n",
                     static_cast<unsigned>(jobStats.bytesReceived),
+                    static_cast<unsigned>(buffered),
                     static_cast<unsigned>(jobStats.chunksReceived));
       lastProgressLogAtMs = millis();
     }
@@ -382,6 +563,10 @@ void processPrintStream() {
   const uint32_t idleTimeoutMs =
       jobStats.bytesReceived > 0 ? kPrintIdleTimeoutMs : kClientProbeTimeoutMs;
   if (jobStats.active && millis() - jobStats.lastDataAtMs > idleTimeoutMs) {
+    // Don't timeout while buffer still has data being drained to USB
+    if (bufferUsed() > 0 && !printBuf.drain_error) {
+      return;
+    }
     finishJob(jobStats.bytesReceived > 0 ? "idle timeout" : "probe timeout",
               jobStats.bytesReceived > 0);
     activeClient.stop();
@@ -415,10 +600,12 @@ void logHeartbeat() {
   UsbPrinterBridgeStatus usb{};
   usb_printer_bridge::get_status(&usb);
 
+  const size_t buf_used = bufferUsed();
+
   if (startedAsAccessPoint) {
     Serial.printf("[HEARTBEAT] state=%s mode=AP ip=%s clients=%u usb_device=%s "
                   "usb_ready=%s vid=%04x pid=%04x out=0x%02x fwd=%u drop=%u "
-                  "fail=%u\n",
+                  "fail=%u buf=%u/%uK\n",
                   stateName(currentState), WiFi.softAPIP().toString().c_str(),
                   WiFi.softAPgetStationNum(),
                   usb.device_connected ? "yes" : "no",
@@ -426,20 +613,24 @@ void logHeartbeat() {
                   usb.product_id, usb.out_endpoint,
                   static_cast<unsigned>(usb.total_forwarded_bytes),
                   static_cast<unsigned>(usb.total_dropped_bytes),
-                  static_cast<unsigned>(usb.failed_transfer_count));
+                  static_cast<unsigned>(usb.failed_transfer_count),
+                  static_cast<unsigned>(buf_used),
+                  static_cast<unsigned>(kPrintBufferCapacity / 1024));
     return;
   }
 
   Serial.printf("[HEARTBEAT] state=%s mode=STA ip=%s rssi=%d usb_device=%s "
                 "usb_ready=%s vid=%04x pid=%04x out=0x%02x fwd=%u drop=%u "
-                "fail=%u\n",
+                "fail=%u buf=%u/%uK\n",
                 stateName(currentState), WiFi.localIP().toString().c_str(),
                 WiFi.RSSI(), usb.device_connected ? "yes" : "no",
                 usb.printer_ready ? "yes" : "no", usb.vendor_id,
                 usb.product_id, usb.out_endpoint,
                 static_cast<unsigned>(usb.total_forwarded_bytes),
                 static_cast<unsigned>(usb.total_dropped_bytes),
-                static_cast<unsigned>(usb.failed_transfer_count));
+                static_cast<unsigned>(usb.failed_transfer_count),
+                static_cast<unsigned>(buf_used),
+                static_cast<unsigned>(kPrintBufferCapacity / 1024));
 }
 
 void writeDebugPrompt(WiFiClient &client) { client.print(F("esp32-print> ")); }
@@ -506,6 +697,12 @@ void writeDebugStatus(WiFiClient &client) {
   client.println(usb.failed_transfer_count);
   client.print(F("usb_last_error="));
   client.println(usb.last_error);
+  client.print(F("buffer_used_bytes="));
+  client.println(bufferUsed());
+  client.print(F("buffer_capacity_bytes="));
+  client.println(kPrintBufferCapacity);
+  client.print(F("buffer_drain_error="));
+  client.println(printBuf.drain_error ? F("true") : F("false"));
 }
 
 void writeDebugHelp(WiFiClient &client) {
@@ -514,6 +711,7 @@ void writeDebugHelp(WiFiClient &client) {
   client.println(F("  status - full bridge status"));
   client.println(F("  usb    - USB counters and last error"));
   client.println(F("  job    - current job counters"));
+  client.println(F("  buf    - print buffer status"));
   client.println(F("  heap   - heap and reset info"));
   client.println(F("  close  - close this debug session"));
 }
@@ -588,6 +786,15 @@ void handleDebugCommand(WiFiClient &client, const char *rawCommand) {
     writeJobSummary(client);
     return;
   }
+  if (strcmp(start, "buf") == 0) {
+    const size_t used = bufferUsed();
+    client.printf("used=%u capacity=%u drain_error=%s job_active=%s\n",
+                  static_cast<unsigned>(used),
+                  static_cast<unsigned>(kPrintBufferCapacity),
+                  printBuf.drain_error ? "yes" : "no",
+                  printBuf.job_active ? "yes" : "no");
+    return;
+  }
   if (strcmp(start, "heap") == 0) {
     writeHeapSummary(client);
     return;
@@ -659,6 +866,29 @@ void pollDebugServer() {
   }
 }
 
+void checkWifiConnection() {
+  if (startedAsAccessPoint) {
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    // If we were showing WifiConnecting, restore idle state now
+    if (currentState == DeviceState::WifiConnecting) {
+      Serial.printf("[WIFI] Reconnected, IP=%s\n",
+                    WiFi.localIP().toString().c_str());
+      setState(idleStateForCurrentHardware());
+    }
+    return;
+  }
+  // Wi-Fi dropped — show it in state unless a job is active (auto-reconnect
+  // handles the actual reconnection in the background)
+  if (!jobStats.active &&
+      currentState != DeviceState::WifiConnecting &&
+      currentState != DeviceState::Error) {
+    Serial.println("[WIFI] Connection lost, waiting for auto-reconnect");
+    setState(DeviceState::WifiConnecting);
+  }
+}
+
 void syncIdleStateWithPrinter() {
   if (currentState == DeviceState::Booting ||
       currentState == DeviceState::WifiConnecting ||
@@ -726,6 +956,22 @@ void setup() {
     return;
   }
 
+  if (!initPrintBuffer()) {
+    Serial.println("[ERROR] Print buffer allocation failed");
+    setState(DeviceState::Error);
+    return;
+  }
+  Serial.printf("[BUFFER] %uKB read-ahead buffer allocated (%s)\n",
+                static_cast<unsigned>(kPrintBufferCapacity / 1024),
+                printBuf.storage >= (uint8_t *)0x3C000000 ? "PSRAM" : "heap");
+  xTaskCreatePinnedToCore(printBufferDrainTask, "buf_drain", 4096, nullptr, 10,
+                          &printBuf.drain_task, 0);
+  if (printBuf.drain_task == nullptr) {
+    Serial.println("[ERROR] Buffer drain task creation failed");
+    setState(DeviceState::Error);
+    return;
+  }
+
   startPrintServer();
   startDebugServer();
   logNetworkSummary();
@@ -741,6 +987,7 @@ void loop() {
   processPrintStream();
   restoreReadyStateIfNeeded();
   syncIdleStateWithPrinter();
+  checkWifiConnection();
   logHeartbeat();
   delay(5);
 }
