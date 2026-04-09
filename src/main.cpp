@@ -11,6 +11,7 @@ extern "C" {
 }
 
 #include "network_config.h"
+#include "ring_buffer.h"
 #include "usb_printer_bridge.h"
 
 #ifndef RGB_LED_PIN
@@ -30,11 +31,14 @@ constexpr uint16_t kDebugPort = 2323;
 constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kClientProbeTimeoutMs = 5000;
 constexpr uint32_t kPrintIdleTimeoutMs = 30000;
-constexpr uint32_t kChunkBufferSize = 512;
+constexpr uint32_t kChunkBufferSize = 4096;
+constexpr size_t kDrainChunkSize = 1024;
 constexpr size_t kDebugCommandMax = 96;
 constexpr size_t kDebugBytesPerPoll = 64;
-constexpr size_t kPrintBufferCapacity = 128 * 1024;  // 128KB read-ahead buffer
+constexpr size_t kPrintBufferCapacity = 512 * 1024;  // 512KB read-ahead buffer
 constexpr uint32_t kBufferFlushTimeoutMs = 30000;
+constexpr size_t kPrefillBytes = 64 * 1024;           // pre-fill before USB drain starts
+constexpr uint32_t kPrefillTimeoutMs = 2000;           // max wait for pre-fill
 
 enum class DeviceState {
   Booting,
@@ -57,16 +61,15 @@ struct JobStats {
 } jobStats;
 
 struct PrintRingBuffer {
-  uint8_t *storage = nullptr;
-  size_t capacity = 0;
-  size_t head = 0;
-  size_t tail = 0;
+  RingBuffer ring;
   SemaphoreHandle_t mutex = nullptr;
   SemaphoreHandle_t data_ready = nullptr;
   TaskHandle_t drain_task = nullptr;
   volatile bool drain_error = false;
   volatile bool job_active = false;
   volatile uint32_t job_generation = 0;
+  volatile bool prefill_done = false;
+  volatile uint32_t prefill_start_ms = 0;
 } printBuf;
 
 DeviceState currentState = DeviceState::Booting;
@@ -293,28 +296,13 @@ void startDebugServer() {
 // The main loop writes TCP data in, a FreeRTOS drain task sends it to USB.
 // This eliminates printer starvation caused by network round-trip latency.
 
-size_t bufferUsedLocked() {
-  return (printBuf.head >= printBuf.tail)
-             ? (printBuf.head - printBuf.tail)
-             : (printBuf.capacity - printBuf.tail + printBuf.head);
-}
+size_t bufferUsedLocked() { return printBuf.ring.used(); }
 
-size_t bufferFreeLocked() {
-  return printBuf.capacity - 1 - bufferUsedLocked();
-}
+size_t bufferFreeLocked() { return printBuf.ring.free_space(); }
 
 size_t bufferWrite(const uint8_t *data, size_t len) {
   xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
-  const size_t free = bufferFreeLocked();
-  const size_t n = min(len, free);
-  if (n > 0) {
-    const size_t first = min(n, printBuf.capacity - printBuf.head);
-    memcpy(printBuf.storage + printBuf.head, data, first);
-    if (n > first) {
-      memcpy(printBuf.storage, data + first, n - first);
-    }
-    printBuf.head = (printBuf.head + n) % printBuf.capacity;
-  }
+  const size_t n = printBuf.ring.write(data, len);
   xSemaphoreGive(printBuf.mutex);
   if (n > 0) {
     xSemaphoreGive(printBuf.data_ready);
@@ -324,24 +312,14 @@ size_t bufferWrite(const uint8_t *data, size_t len) {
 
 size_t bufferRead(uint8_t *data, size_t maxLen) {
   xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
-  const size_t used = bufferUsedLocked();
-  const size_t n = min(maxLen, used);
-  if (n > 0) {
-    const size_t first = min(n, printBuf.capacity - printBuf.tail);
-    memcpy(data, printBuf.storage + printBuf.tail, first);
-    if (n > first) {
-      memcpy(data + first, printBuf.storage, n - first);
-    }
-    printBuf.tail = (printBuf.tail + n) % printBuf.capacity;
-  }
+  const size_t n = printBuf.ring.read(data, maxLen);
   xSemaphoreGive(printBuf.mutex);
   return n;
 }
 
 void bufferReset() {
   xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
-  printBuf.head = 0;
-  printBuf.tail = 0;
+  printBuf.ring.reset();
   printBuf.drain_error = false;
   xSemaphoreGive(printBuf.mutex);
   xSemaphoreTake(printBuf.data_ready, 0);
@@ -349,30 +327,47 @@ void bufferReset() {
 
 size_t bufferUsed() {
   xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
-  const size_t used = bufferUsedLocked();
+  const size_t used = printBuf.ring.used();
   xSemaphoreGive(printBuf.mutex);
   return used;
 }
 
 bool initPrintBuffer() {
-  printBuf.storage = static_cast<uint8_t *>(ps_malloc(kPrintBufferCapacity));
-  if (printBuf.storage == nullptr) {
-    printBuf.storage = static_cast<uint8_t *>(malloc(kPrintBufferCapacity));
+  printBuf.ring.storage =
+      static_cast<uint8_t *>(ps_malloc(kPrintBufferCapacity));
+  if (printBuf.ring.storage == nullptr) {
+    printBuf.ring.storage =
+        static_cast<uint8_t *>(malloc(kPrintBufferCapacity));
   }
-  if (printBuf.storage == nullptr) {
+  if (printBuf.ring.storage == nullptr) {
     return false;
   }
-  printBuf.capacity = kPrintBufferCapacity;
+  printBuf.ring.capacity = kPrintBufferCapacity;
   printBuf.mutex = xSemaphoreCreateMutex();
   printBuf.data_ready = xSemaphoreCreateBinary();
   return printBuf.mutex != nullptr && printBuf.data_ready != nullptr;
 }
 
 void printBufferDrainTask(void *) {
-  uint8_t chunk[kChunkBufferSize];
+  uint8_t chunk[kDrainChunkSize];
   for (;;) {
-    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(50));
+    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(10));
     const uint32_t gen = printBuf.job_generation;
+
+    // Pre-fill gate: accumulate data before starting USB output so the
+    // printer receives a steady stream instead of starving on WiFi jitter.
+    if (printBuf.job_active && !printBuf.prefill_done) {
+      const size_t buffered = bufferUsed();
+      const uint32_t elapsed = millis() - printBuf.prefill_start_ms;
+      if (buffered < kPrefillBytes && elapsed < kPrefillTimeoutMs) {
+        continue;
+      }
+      printBuf.prefill_done = true;
+      Serial.printf("[BUFFER] Pre-fill %s (%u bytes in %lu ms)\n",
+                    buffered >= kPrefillBytes ? "reached" : "timed out",
+                    static_cast<unsigned>(buffered), elapsed);
+    }
+
     while (printBuf.job_active && !printBuf.drain_error) {
       const size_t n = bufferRead(chunk, sizeof(chunk));
       if (n == 0) {
@@ -392,6 +387,7 @@ void printBufferDrainTask(void *) {
 }
 
 void flushPrintBuffer() {
+  printBuf.prefill_done = true;  // force drain even if below watermark
   const uint32_t start = millis();
   while (millis() - start < kBufferFlushTimeoutMs) {
     if (printBuf.drain_error) {
@@ -415,6 +411,10 @@ void beginJob(WiFiClient &client) {
   bufferReset();
   printBuf.job_generation++;
   printBuf.job_active = true;
+  printBuf.prefill_done = false;
+  printBuf.prefill_start_ms = millis();
+
+  client.setNoDelay(true);
 
   jobStats.active = true;
   jobStats.bytesReceived = 0;
@@ -963,7 +963,8 @@ void setup() {
   }
   Serial.printf("[BUFFER] %uKB read-ahead buffer allocated (%s)\n",
                 static_cast<unsigned>(kPrintBufferCapacity / 1024),
-                printBuf.storage >= (uint8_t *)0x3C000000 ? "PSRAM" : "heap");
+                printBuf.ring.storage >= (uint8_t *)0x3C000000 ? "PSRAM"
+                                                                           : "heap");
   xTaskCreatePinnedToCore(printBufferDrainTask, "buf_drain", 4096, nullptr, 10,
                           &printBuf.drain_task, 0);
   if (printBuf.drain_task == nullptr) {
@@ -989,5 +990,5 @@ void loop() {
   syncIdleStateWithPrinter();
   checkWifiConnection();
   logHeartbeat();
-  delay(5);
+  delay(currentState == DeviceState::Printing ? 1 : 5);
 }
