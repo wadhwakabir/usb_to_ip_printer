@@ -2,8 +2,11 @@
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include <ctype.h>
+extern "C" {
+#include "esp_system.h"
+}
 
-#include "http_status_utils.h"
 #include "network_config.h"
 #include "usb_printer_bridge.h"
 
@@ -20,12 +23,13 @@ Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 namespace {
 
 constexpr uint16_t kRawPrintPort = 9100;
-constexpr uint16_t kStatusPort = 80;
+constexpr uint16_t kDebugPort = 2323;
 constexpr uint32_t kWifiConnectTimeoutMs = 15000;
-constexpr uint32_t kPrintIdleTimeoutMs = 2500;
+constexpr uint32_t kClientProbeTimeoutMs = 5000;
+constexpr uint32_t kPrintIdleTimeoutMs = 30000;
 constexpr uint32_t kChunkBufferSize = 512;
-constexpr size_t kHttpRequestLineMax = 256;
-constexpr uint32_t kHttpClientReadTimeoutMs = 25;
+constexpr size_t kDebugCommandMax = 96;
+constexpr size_t kDebugBytesPerPoll = 64;
 
 enum class DeviceState {
   Booting,
@@ -49,14 +53,48 @@ struct JobStats {
 
 DeviceState currentState = DeviceState::Booting;
 WiFiServer printServer(kRawPrintPort);
-WiFiServer statusServer(kStatusPort);
+WiFiServer debugServer(kDebugPort);
 WiFiClient activeClient;
+WiFiClient debugClient;
 bool startedAsAccessPoint = false;
 uint32_t stateChangedAtMs = 0;
 uint32_t lastHeartbeatAtMs = 0;
 uint32_t lastWifiLogAtMs = 0;
 uint32_t lastProgressLogAtMs = 0;
 uint32_t bootedAtMs = 0;
+char debugCommandBuffer[kDebugCommandMax] = {0};
+size_t debugCommandLength = 0;
+RTC_DATA_ATTR uint32_t bootCount = 0;
+esp_reset_reason_t lastResetReason = ESP_RST_UNKNOWN;
+
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN:
+      return "unknown";
+    case ESP_RST_POWERON:
+      return "power_on";
+    case ESP_RST_EXT:
+      return "external_pin";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt_wdt";
+    case ESP_RST_TASK_WDT:
+      return "task_wdt";
+    case ESP_RST_WDT:
+      return "other_wdt";
+    case ESP_RST_DEEPSLEEP:
+      return "deep_sleep";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_SDIO:
+      return "sdio";
+    default:
+      return "other";
+  }
+}
 
 uint32_t ledColor(uint8_t red, uint8_t green, uint8_t blue) {
   return rgbLed.Color(red, green, blue);
@@ -143,7 +181,7 @@ void updateLed() {
 void logNetworkSummary() {
   Serial.printf("[NET] Hostname: %s.local\n", PRINTER_HOSTNAME);
   Serial.printf("[NET] RAW print port: %u\n", kRawPrintPort);
-  Serial.printf("[NET] Status HTTP port: %u\n", kStatusPort);
+  Serial.printf("[NET] Debug TCP port: %u\n", kDebugPort);
   if (startedAsAccessPoint) {
     Serial.printf("[NET] AP SSID: %s\n", WIFI_AP_SSID);
     Serial.printf("[NET] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -225,11 +263,11 @@ void startPrintServer() {
                 kRawPrintPort);
 }
 
-void startStatusServer() {
-  statusServer.begin();
-  statusServer.setNoDelay(true);
-  Serial.printf("[SERVER] HTTP status server listening on port %u\n",
-                kStatusPort);
+void startDebugServer() {
+  debugServer.begin();
+  debugServer.setNoDelay(true);
+  Serial.printf("[SERVER] TCP debug console listening on port %u\n",
+                kDebugPort);
 }
 
 void beginJob(WiFiClient &client) {
@@ -270,7 +308,7 @@ bool deliverPrintData(const uint8_t *data, size_t length) {
 void pollForClients() {
   if (!activeClient || !activeClient.connected()) {
     if (jobStats.active) {
-      finishJob("client disconnected");
+      finishJob("client disconnected", jobStats.bytesReceived > 0);
     }
 
     activeClient.stop();
@@ -341,8 +379,11 @@ void processPrintStream() {
     }
   }
 
-  if (jobStats.active && millis() - jobStats.lastDataAtMs > kPrintIdleTimeoutMs) {
-    finishJob("idle timeout");
+  const uint32_t idleTimeoutMs =
+      jobStats.bytesReceived > 0 ? kPrintIdleTimeoutMs : kClientProbeTimeoutMs;
+  if (jobStats.active && millis() - jobStats.lastDataAtMs > idleTimeoutMs) {
+    finishJob(jobStats.bytesReceived > 0 ? "idle timeout" : "probe timeout",
+              jobStats.bytesReceived > 0);
     activeClient.stop();
   }
 }
@@ -359,7 +400,8 @@ void restoreReadyStateIfNeeded() {
   }
 
   if (currentState == DeviceState::Error &&
-      millis() - stateChangedAtMs > 1500) {
+      millis() - stateChangedAtMs > 1500 &&
+      !usb_printer_bridge::is_faulted()) {
     setState(idleStateForCurrentHardware());
   }
 }
@@ -400,293 +442,221 @@ void logHeartbeat() {
                 static_cast<unsigned>(usb.failed_transfer_count));
 }
 
-String htmlEscape(const String &input) {
-  return String(http_status_utils::EscapeHtml(input.c_str()).c_str());
-}
+void writeDebugPrompt(WiFiClient &client) { client.print(F("esp32-print> ")); }
 
-String jsonEscape(const String &input) {
-  return String(http_status_utils::EscapeJson(input.c_str()).c_str());
-}
-
-String formatStatusJson() {
-  UsbPrinterBridgeStatus usb{};
-  usb_printer_bridge::get_status(&usb);
-
-  String json;
-  json.reserve(1024);
-  json += F("{");
-  json += F("\"state\":\"");
-  json += stateName(currentState);
-  json += F("\",\"mode\":\"");
-  json += startedAsAccessPoint ? F("AP") : F("STA");
-  json += F("\",\"ip\":\"");
-  json += startedAsAccessPoint ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
-  json += F("\",\"hostname\":\"");
-  json += PRINTER_HOSTNAME;
-  json += F(".local\",\"wifi_ssid\":\"");
-  json += jsonEscape(startedAsAccessPoint ? String(WIFI_AP_SSID) : WiFi.SSID());
-  json += F("\",\"wifi_rssi\":");
-  json += String(startedAsAccessPoint ? 0 : WiFi.RSSI());
-  json += F(",\"raw_port\":");
-  json += String(kRawPrintPort);
-  json += F(",\"status_port\":");
-  json += String(kStatusPort);
-  json += F(",\"uptime_ms\":");
-  json += String(millis() - bootedAtMs);
-  json += F(",\"job_active\":");
-  json += jobStats.active ? F("true") : F("false");
-  json += F(",\"job_bytes_received\":");
-  json += String(jobStats.bytesReceived);
-  json += F(",\"job_chunks_received\":");
-  json += String(jobStats.chunksReceived);
-  json += F(",\"usb_host_running\":");
-  json += usb.host_running ? F("true") : F("false");
-  json += F(",\"usb_device_connected\":");
-  json += usb.device_connected ? F("true") : F("false");
-  json += F(",\"usb_printer_ready\":");
-  json += usb.printer_ready ? F("true") : F("false");
-  json += F(",\"usb_dry_run_mode\":");
-  json += usb.dry_run_mode ? F("true") : F("false");
-  json += F(",\"usb_vendor_id\":\"");
-  json += http_status_utils::FormatHex16(usb.vendor_id).c_str();
-  json += F("\",\"usb_product_id\":\"");
-  json += http_status_utils::FormatHex16(usb.product_id).c_str();
-  json += F("\",\"usb_interface_number\":");
-  json += String(usb.interface_number);
-  json += F(",\"usb_out_endpoint\":");
-  json += String(usb.out_endpoint);
-  json += F(",\"usb_total_forwarded_bytes\":");
-  json += String(usb.total_forwarded_bytes);
-  json += F(",\"usb_total_dropped_bytes\":");
-  json += String(usb.total_dropped_bytes);
-  json += F(",\"usb_failed_transfer_count\":");
-  json += String(usb.failed_transfer_count);
-  json += F(",\"usb_last_error\":\"");
-  json += jsonEscape(String(usb.last_error));
-  json += F("\"}");
-  return json;
-}
-
-String formatStatusHtml() {
+void writeDebugStatus(WiFiClient &client) {
   UsbPrinterBridgeStatus usb{};
   usb_printer_bridge::get_status(&usb);
 
   const String ip = startedAsAccessPoint ? WiFi.softAPIP().toString()
                                          : WiFi.localIP().toString();
   const String ssid = startedAsAccessPoint ? String(WIFI_AP_SSID) : WiFi.SSID();
-  const String usbError = String(usb.last_error);
 
-  String html;
-  html.reserve(4096);
-  html += F(
-      "<!doctype html><html><head><meta charset='utf-8'>"
-      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<title>ESP32 Print Bridge Status</title>"
-      "<style>"
-      ":root{--bg:#f5f1e8;--card:#fffdf9;--ink:#1e241f;--muted:#5f6d62;"
-      "--line:#d6d0c3;--ok:#2d8f47;--warn:#c98a00;--err:#c43d2f;--info:#0d7c91;}"
-      "body{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
-      "background:radial-gradient(circle at top,#fff8e7,var(--bg));color:var(--ink);}"
-      ".wrap{max-width:960px;margin:0 auto;padding:24px;}"
-      ".hero,.card{background:var(--card);border:1px solid var(--line);border-radius:18px;"
-      "box-shadow:0 10px 30px rgba(0,0,0,.06);padding:20px;margin-bottom:18px;}"
-      ".hero h1{margin:0 0 8px;font-size:28px;}.hero p{margin:0;color:var(--muted);}"
-      ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;}"
-      ".label{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);}"
-      ".value{font-size:20px;margin-top:6px;word-break:break-word;}"
-      ".pill{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:700;}"
-      ".ok{background:rgba(45,143,71,.14);color:var(--ok);}"
-      ".warn{background:rgba(201,138,0,.15);color:var(--warn);}"
-      ".err{background:rgba(196,61,47,.14);color:var(--err);}"
-      ".info{background:rgba(13,124,145,.14);color:var(--info);}"
-      "pre{white-space:pre-wrap;word-break:break-word;background:#f3efe6;border-radius:12px;padding:14px;}"
-      "a{color:var(--info);text-decoration:none;}"
-      "</style></head><body><div class='wrap'>");
-  html += F("<section class='hero'><h1>ESP32 RAW Print Bridge</h1><p>Remote status page for TCP 9100 printing and USB printer forwarding.</p></section>");
-
-  html += F("<section class='grid'>");
-  html += F("<div class='card'><div class='label'>State</div><div class='value'>");
-  html += htmlEscape(String(stateName(currentState)));
-  html += F("</div></div>");
-  html += F("<div class='card'><div class='label'>Mode</div><div class='value'>");
-  html += startedAsAccessPoint ? F("Access Point") : F("Wi-Fi Station");
-  html += F("</div></div>");
-  html += F("<div class='card'><div class='label'>IP Address</div><div class='value'>");
-  html += htmlEscape(ip);
-  html += F("</div></div>");
-  html += F("<div class='card'><div class='label'>Uptime</div><div class='value'>");
-  html += String((millis() - bootedAtMs) / 1000);
-  html += F(" s</div></div>");
-  html += F("</section>");
-
-  html += F("<section class='card'><div class='label'>Endpoints</div><div class='value'>RAW <strong>");
-  html += String(kRawPrintPort);
-  html += F("</strong> | Status <strong>");
-  html += String(kStatusPort);
-  html += F("</strong> | JSON <a href='/status.json'>/status.json</a></div></section>");
-
-  html += F("<section class='grid'>");
-  html += F("<div class='card'><div class='label'>Wi-Fi / AP</div><div class='value'>");
-  html += htmlEscape(ssid);
-  if (!startedAsAccessPoint) {
-    html += F("<div class='label'>RSSI</div><div class='value'>");
-    html += String(WiFi.RSSI());
-    html += F(" dBm</div>");
-  }
-  html += F("</div></div>");
-
-  html += F("<div class='card'><div class='label'>USB Printer</div><div class='value'>");
-  html += usb.printer_ready ? F("<span class='pill ok'>READY</span>")
-                            : (usb.device_connected ? F("<span class='pill warn'>DEVICE ATTACHED</span>")
-                                                    : F("<span class='pill warn'>WAITING</span>"));
-  html += F("<div class='label'>VID:PID</div><div class='value'>");
-  html += http_status_utils::FormatHex16(usb.vendor_id).c_str();
-  html += F(":");
-  html += http_status_utils::FormatHex16(usb.product_id).c_str();
-  html += F("</div></div></div>");
-
-  html += F("<div class='card'><div class='label'>Current Job</div><div class='value'>");
-  html += jobStats.active ? F("<span class='pill info'>ACTIVE</span>")
-                          : F("<span class='pill ok'>IDLE</span>");
-  html += F("<div class='label'>Bytes / Chunks</div><div class='value'>");
-  html += String(jobStats.bytesReceived);
-  html += F(" / ");
-  html += String(jobStats.chunksReceived);
-  html += F("</div></div></div>");
-  html += F("</section>");
-
-  html += F("<section class='card'><div class='label'>USB Counters</div><pre>");
-  html += F("Forwarded bytes: ");
-  html += String(usb.total_forwarded_bytes);
-  html += F("\nDropped bytes: ");
-  html += String(usb.total_dropped_bytes);
-  html += F("\nFailed transfers: ");
-  html += String(usb.failed_transfer_count);
-  html += F("\nInterface: ");
-  html += String(usb.interface_number);
-  html += F("\nOUT endpoint: ");
-  html += String(usb.out_endpoint);
-  html += F("\nIN endpoint: ");
-  html += String(usb.in_endpoint);
-  html += F("</pre></section>");
-
-  html += F("<section class='card'><div class='label'>Last USB Status</div><pre>");
-  html += htmlEscape(usbError);
-  html += F("</pre></section>");
-
-  html += F("</div></body></html>");
-  return html;
+  client.print(F("state="));
+  client.println(stateName(currentState));
+  client.print(F("mode="));
+  client.println(startedAsAccessPoint ? F("AP") : F("STA"));
+  client.print(F("ip="));
+  client.println(ip);
+  client.print(F("ssid="));
+  client.println(ssid);
+  client.print(F("raw_port="));
+  client.println(kRawPrintPort);
+  client.print(F("debug_port="));
+  client.println(kDebugPort);
+  client.print(F("uptime_ms="));
+  client.println(millis() - bootedAtMs);
+  client.print(F("boot_count="));
+  client.println(bootCount);
+  client.print(F("reset_reason="));
+  client.println(resetReasonName(lastResetReason));
+  client.print(F("free_heap_bytes="));
+  client.println(ESP.getFreeHeap());
+  client.print(F("min_free_heap_bytes="));
+  client.println(ESP.getMinFreeHeap());
+  client.print(F("job_active="));
+  client.println(jobStats.active ? F("true") : F("false"));
+  client.print(F("job_bytes_received="));
+  client.println(jobStats.bytesReceived);
+  client.print(F("job_chunks_received="));
+  client.println(jobStats.chunksReceived);
+  client.print(F("usb_host_running="));
+  client.println(usb.host_running ? F("true") : F("false"));
+  client.print(F("usb_device_connected="));
+  client.println(usb.device_connected ? F("true") : F("false"));
+  client.print(F("usb_printer_ready="));
+  client.println(usb.printer_ready ? F("true") : F("false"));
+  client.print(F("usb_backend_faulted="));
+  client.println(usb.backend_faulted ? F("true") : F("false"));
+  client.print(F("usb_vendor_id="));
+  client.printf("%04x\n", usb.vendor_id);
+  client.print(F("usb_product_id="));
+  client.printf("%04x\n", usb.product_id);
+  client.print(F("usb_interface_number="));
+  client.println(usb.interface_number);
+  client.print(F("usb_out_endpoint="));
+  client.println(usb.out_endpoint);
+  client.print(F("usb_in_endpoint="));
+  client.println(usb.in_endpoint);
+  client.print(F("usb_total_forwarded_bytes="));
+  client.println(usb.total_forwarded_bytes);
+  client.print(F("usb_total_dropped_bytes="));
+  client.println(usb.total_dropped_bytes);
+  client.print(F("usb_failed_transfer_count="));
+  client.println(usb.failed_transfer_count);
+  client.print(F("usb_last_error="));
+  client.println(usb.last_error);
 }
 
-void writeHttpResponse(WiFiClient &client, const char *statusLine,
-                       const char *contentType, const String &body) {
-  client.print(statusLine);
-  client.print(F("\r\nContent-Type: "));
-  client.print(contentType);
-  client.print(F("\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: "));
-  client.print(body.length());
-  client.print(F("\r\n\r\n"));
-  client.print(body);
+void writeDebugHelp(WiFiClient &client) {
+  client.println(F("Commands:"));
+  client.println(F("  help   - show this help"));
+  client.println(F("  status - full bridge status"));
+  client.println(F("  usb    - USB counters and last error"));
+  client.println(F("  job    - current job counters"));
+  client.println(F("  heap   - heap and reset info"));
+  client.println(F("  close  - close this debug session"));
 }
 
-void handleStatusClient(WiFiClient &client) {
-  String requestLine;
-  requestLine.reserve(kHttpRequestLineMax);
-  bool requestLineComplete = false;
+void writeUsbSummary(WiFiClient &client) {
+  UsbPrinterBridgeStatus usb{};
+  usb_printer_bridge::get_status(&usb);
 
-  const uint32_t deadline = millis() + kHttpClientReadTimeoutMs;
-  while (millis() < deadline && requestLine.length() < kHttpRequestLineMax) {
-    while (client.available() > 0 && requestLine.length() < kHttpRequestLineMax) {
-      const char c = static_cast<char>(client.read());
-      if (c == '\r') {
-        continue;
-      }
-      if (c == '\n') {
-        requestLineComplete = true;
-        break;
-      }
-      requestLine += c;
-    }
-    if (requestLineComplete) {
-      break;
-    }
-    delay(1);
+  client.printf("ready=%s device=%s faulted=%s vid=%04x pid=%04x out=0x%02x in=0x%02x\n",
+                usb.printer_ready ? "yes" : "no",
+                usb.device_connected ? "yes" : "no",
+                usb.backend_faulted ? "yes" : "no", usb.vendor_id,
+                usb.product_id, usb.out_endpoint, usb.in_endpoint);
+  client.printf("forwarded=%u dropped=%u failed=%u\n",
+                static_cast<unsigned>(usb.total_forwarded_bytes),
+                static_cast<unsigned>(usb.total_dropped_bytes),
+                static_cast<unsigned>(usb.failed_transfer_count));
+  client.print(F("last_error="));
+  client.println(usb.last_error);
+}
+
+void writeJobSummary(WiFiClient &client) {
+  client.printf("active=%s bytes=%u chunks=%u state=%s\n",
+                jobStats.active ? "yes" : "no",
+                static_cast<unsigned>(jobStats.bytesReceived),
+                static_cast<unsigned>(jobStats.chunksReceived),
+                stateName(currentState));
+}
+
+void writeHeapSummary(WiFiClient &client) {
+  client.printf("free_heap=%u min_free_heap=%u uptime_ms=%lu boot_count=%lu reset_reason=%s\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap(), millis() - bootedAtMs,
+                bootCount, resetReasonName(lastResetReason));
+}
+
+void handleDebugCommand(WiFiClient &client, const char *rawCommand) {
+  char command[kDebugCommandMax] = {0};
+  size_t length = 0;
+  while (rawCommand[length] != '\0' && length + 1 < sizeof(command)) {
+    command[length] = static_cast<char>(tolower(rawCommand[length]));
+    length += 1;
+  }
+  command[length] = '\0';
+
+  while (length > 0 &&
+         (command[length - 1] == ' ' || command[length - 1] == '\t')) {
+    command[--length] = '\0';
   }
 
-  requestLine.trim();
-  if (!requestLineComplete || requestLine.length() == 0 ||
-      requestLine.length() >= kHttpRequestLineMax) {
-    const String body = F("Bad Request\n");
-    writeHttpResponse(client, "HTTP/1.1 400 Bad Request",
-                      "text/plain; charset=utf-8", body);
+  char *start = command;
+  while (*start == ' ' || *start == '\t') {
+    start += 1;
+  }
+
+  if (*start == '\0') {
     return;
   }
 
-  bool saw_blank_line = false;
-  String headerWindow;
-  headerWindow.reserve(4);
-  const uint32_t headerDeadline = millis() + kHttpClientReadTimeoutMs;
-  while (millis() < headerDeadline && client.connected()) {
-    while (client.available() > 0) {
-      const char c = static_cast<char>(client.read());
-      if (headerWindow.length() == 4) {
-        headerWindow.remove(0, 1);
-      }
-      headerWindow += c;
-      if (headerWindow.endsWith("\r\n\r\n") || headerWindow.endsWith("\n\n")) {
-        saw_blank_line = true;
-        break;
-      }
-    }
-    if (saw_blank_line) {
-      break;
-    }
-    delay(1);
+  if (strcmp(start, "help") == 0) {
+    writeDebugHelp(client);
+    return;
   }
-
-  if (!saw_blank_line) {
-    const String body = F("Request Timeout\n");
-    writeHttpResponse(client, "HTTP/1.1 408 Request Timeout",
-                      "text/plain; charset=utf-8", body);
+  if (strcmp(start, "status") == 0) {
+    writeDebugStatus(client);
+    return;
+  }
+  if (strcmp(start, "usb") == 0) {
+    writeUsbSummary(client);
+    return;
+  }
+  if (strcmp(start, "job") == 0) {
+    writeJobSummary(client);
+    return;
+  }
+  if (strcmp(start, "heap") == 0) {
+    writeHeapSummary(client);
+    return;
+  }
+  if (strcmp(start, "close") == 0 || strcmp(start, "exit") == 0 ||
+      strcmp(start, "quit") == 0) {
+    client.println(F("Closing debug session."));
+    client.stop();
     return;
   }
 
-  Serial.printf("[HTTP] %s\n", requestLine.c_str());
-
-  switch (http_status_utils::ClassifyRequestLine(requestLine.c_str())) {
-    case http_status_utils::RequestRoute::kStatusJson:
-    writeHttpResponse(client, "HTTP/1.1 200 OK", "application/json",
-                      formatStatusJson());
-      return;
-    case http_status_utils::RequestRoute::kRoot:
-      writeHttpResponse(client, "HTTP/1.1 200 OK", "text/html; charset=utf-8",
-                        formatStatusHtml());
-      return;
-    case http_status_utils::RequestRoute::kNotFound: {
-      const String body = F("Not Found\n");
-      writeHttpResponse(client, "HTTP/1.1 404 Not Found",
-                        "text/plain; charset=utf-8", body);
-      return;
-    }
-    case http_status_utils::RequestRoute::kBadRequest:
-    default: {
-      const String body = F("Bad Request\n");
-      writeHttpResponse(client, "HTTP/1.1 400 Bad Request",
-                        "text/plain; charset=utf-8", body);
-      return;
-    }
-  }
+  client.print(F("Unknown command: "));
+  client.println(start);
+  writeDebugHelp(client);
 }
 
-void pollStatusServer() {
-  WiFiClient statusClient = statusServer.available();
-  if (!statusClient) {
+void pollDebugServer() {
+  if (!debugClient || !debugClient.connected()) {
+    if (debugClient) {
+      debugClient.stop();
+    }
+
+    WiFiClient nextClient = debugServer.available();
+    if (!nextClient) {
+      return;
+    }
+
+    debugClient = nextClient;
+    debugClient.setNoDelay(true);
+    debugCommandLength = 0;
+    Serial.printf("[DEBUG] Console connected from %s:%u\n",
+                  debugClient.remoteIP().toString().c_str(),
+                  debugClient.remotePort());
+    debugClient.println(F("ESP32 Print Bridge Debug Console"));
+    debugClient.println(F("Type 'help' for commands."));
+    writeDebugPrompt(debugClient);
     return;
   }
 
-  handleStatusClient(statusClient);
-  delay(5);
-  statusClient.stop();
+  WiFiClient extraClient = debugServer.available();
+  if (extraClient) {
+    extraClient.println(F("BUSY"));
+    extraClient.stop();
+  }
+
+  size_t bytesProcessed = 0;
+  while (debugClient.available() > 0 && bytesProcessed < kDebugBytesPerPoll) {
+    const char c = static_cast<char>(debugClient.read());
+    bytesProcessed += 1;
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      debugCommandBuffer[debugCommandLength] = '\0';
+      handleDebugCommand(debugClient, debugCommandBuffer);
+      if (debugClient && debugClient.connected()) {
+        writeDebugPrompt(debugClient);
+      }
+      debugCommandLength = 0;
+      continue;
+    }
+    if (debugCommandLength + 1 >= sizeof(debugCommandBuffer)) {
+      debugClient.println(F("Command too long."));
+      debugCommandLength = 0;
+      writeDebugPrompt(debugClient);
+      continue;
+    }
+    debugCommandBuffer[debugCommandLength++] = c;
+  }
 }
 
 void syncIdleStateWithPrinter() {
@@ -710,6 +680,8 @@ void syncIdleStateWithPrinter() {
 void setup() {
   Serial.begin(115200);
   delay(1200);
+  bootCount += 1;
+  lastResetReason = esp_reset_reason();
   bootedAtMs = millis();
 
   rgbLed.begin();
@@ -721,6 +693,8 @@ void setup() {
 
   Serial.println();
   Serial.println("ESP32-S3 RAW TCP Print Server");
+  Serial.printf("[BOOT] Boot count: %lu\n", bootCount);
+  Serial.printf("[BOOT] Reset reason: %s\n", resetReasonName(lastResetReason));
   Serial.printf("[BOOT] CPU frequency: %lu MHz\n", getCpuFrequencyMhz());
 
   if (psramInit()) {
@@ -753,7 +727,7 @@ void setup() {
   }
 
   startPrintServer();
-  startStatusServer();
+  startDebugServer();
   logNetworkSummary();
   Serial.println("[USB] Waiting for a USB printer on the ESP32-S3 host port");
   setState(idleStateForCurrentHardware());
@@ -763,7 +737,7 @@ void loop() {
   updateLed();
 
   pollForClients();
-  pollStatusServer();
+  pollDebugServer();
   processPrintStream();
   restoreReadyStateIfNeeded();
   syncIdleStateWithPrinter();

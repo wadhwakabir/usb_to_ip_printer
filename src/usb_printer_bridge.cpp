@@ -37,6 +37,7 @@ struct BridgeState {
   bool client_registered = false;
   bool device_connected = false;
   bool printer_ready = false;
+  bool backend_faulted = false;
   bool dry_run_mode = kAllowDryRunWithoutPrinter;
 
   bool new_device_pending = false;
@@ -267,6 +268,7 @@ bool inspect_interfaces(usb_device_handle_t device_hdl) {
   g_state.in_endpoint = selected_in;
   g_state.out_endpoint_mps = selected_mps;
   g_state.printer_ready = true;
+  g_state.backend_faulted = false;
   set_printer_ready_message_locked();
   xSemaphoreGive(g_state.state_mutex);
 
@@ -282,6 +284,7 @@ void close_active_device() {
     xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
     g_state.device_connected = false;
     g_state.printer_ready = false;
+    g_state.backend_faulted = false;
     g_state.device_address = 0;
     g_state.vendor_id = 0;
     g_state.product_id = 0;
@@ -305,6 +308,7 @@ void close_active_device() {
   g_state.device_hdl = nullptr;
   g_state.device_connected = false;
   g_state.printer_ready = false;
+  g_state.backend_faulted = false;
   g_state.device_address = 0;
   g_state.vendor_id = 0;
   g_state.product_id = 0;
@@ -372,6 +376,7 @@ void handle_new_device(uint8_t device_address) {
   g_state.vendor_id = device_desc->idVendor;
   g_state.product_id = device_desc->idProduct;
   g_state.printer_ready = false;
+  g_state.backend_faulted = false;
   set_last_error_locked("USB device attached, probing interfaces");
   xSemaphoreGive(g_state.state_mutex);
 
@@ -498,6 +503,7 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
   usb_transfer_t *transfer = g_state.out_transfer;
   if (g_state.transfer_in_flight) {
     g_state.failed_transfer_count += 1;
+    g_state.backend_faulted = true;
     set_last_error("USB transfer is still in flight");
     return false;
   }
@@ -509,10 +515,10 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
   transfer->callback = transfer_callback;
   transfer->context = &g_state;
   transfer->timeout_ms = 0;
-  transfer->flags =
-      (g_state.out_endpoint_mps > 0 && length % g_state.out_endpoint_mps == 0)
-          ? USB_TRANSFER_FLAG_ZERO_PACK
-          : 0;
+  // Each OUT write is already submitted as its own USB transfer. Appending a
+  // zero-length packet to every exact-MPS chunk can prematurely terminate or
+  // confuse printer-side framing, so keep the host transfer flags clear here.
+  transfer->flags = 0;
 
   g_state.transfer_in_flight = true;
   esp_err_t err = usb_host_transfer_submit(transfer);
@@ -520,6 +526,7 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
     g_state.transfer_in_flight = false;
     Serial.printf("[USB] Transfer submit failed: %s\n", esp_err_to_name(err));
     g_state.failed_transfer_count += 1;
+    g_state.backend_faulted = true;
     set_last_error("USB transfer submit failed: %s", esp_err_to_name(err));
     return false;
   }
@@ -527,6 +534,7 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
   if (xSemaphoreTake(g_state.transfer_done, kTransferTimeoutTicks) != pdTRUE) {
     Serial.println("[USB] Transfer timed out waiting for completion");
     g_state.failed_transfer_count += 1;
+    g_state.backend_faulted = true;
     set_last_error("USB transfer completion timed out");
     recover_endpoint_locked("timeout");
     return false;
@@ -539,6 +547,7 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
                   g_state.last_transfer_actual_num_bytes,
                   static_cast<unsigned>(length));
     g_state.failed_transfer_count += 1;
+    g_state.backend_faulted = true;
     set_last_error("USB transfer failed status=%d actual=%d",
                    g_state.last_transfer_status,
                    g_state.last_transfer_actual_num_bytes);
@@ -547,6 +556,7 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
   }
 
   g_state.total_forwarded_bytes += length;
+  g_state.backend_faulted = false;
   set_printer_ready_message_locked();
   return true;
 }
@@ -619,6 +629,18 @@ bool has_device() {
   return connected;
 }
 
+bool is_faulted() {
+  bool faulted = false;
+  if (g_state.state_mutex == nullptr) {
+    return false;
+  }
+
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  faulted = g_state.backend_faulted;
+  xSemaphoreGive(g_state.state_mutex);
+  return faulted;
+}
+
 bool send_raw(const uint8_t *data, size_t length) {
   if (data == nullptr || length == 0) {
     return false;
@@ -681,6 +703,7 @@ void get_status(UsbPrinterBridgeStatus *status) {
   status->host_running = g_state.host_running;
   status->device_connected = g_state.device_connected;
   status->printer_ready = g_state.printer_ready;
+  status->backend_faulted = g_state.backend_faulted;
   status->dry_run_mode = g_state.dry_run_mode;
   status->device_address = g_state.device_address;
   status->vendor_id = g_state.vendor_id;
