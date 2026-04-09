@@ -373,7 +373,7 @@ bool initPrintBuffer() {
 void printBufferDrainTask(void *) {
   uint8_t chunk[kDrainChunkSize];
   for (;;) {
-    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(10));
+    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(1));
     const uint32_t gen = printBuf.job_generation;
 
     // Pre-fill gate: accumulate data before starting USB output so the
@@ -577,14 +577,7 @@ void processPrintStream() {
     }
     setState(DeviceState::Printing);
 
-    if (millis() - lastProgressLogAtMs > 1000) {
-      const size_t buffered = bufferUsed();
-      Serial.printf("[JOB] Progress: %u bytes received, %u buffered, %u chunks\n",
-                    static_cast<unsigned>(jobStats.bytesReceived),
-                    static_cast<unsigned>(buffered),
-                    static_cast<unsigned>(jobStats.chunksReceived));
-      lastProgressLogAtMs = millis();
-    }
+    lastProgressLogAtMs = millis();
   }
 
   const uint32_t idleTimeoutMs =
@@ -619,6 +612,9 @@ void restoreReadyStateIfNeeded() {
 }
 
 void logHeartbeat() {
+  if (currentState == DeviceState::Printing) {
+    return;
+  }
   if (millis() - lastHeartbeatAtMs < 5000) {
     return;
   }
@@ -1013,7 +1009,9 @@ void loop() {
   updateLed();
 
   pollForClients();
-  pollDebugServer();
+  if (currentState != DeviceState::Printing) {
+    pollDebugServer();
+  }
   processPrintStream();
   restoreReadyStateIfNeeded();
   syncIdleStateWithPrinter();
