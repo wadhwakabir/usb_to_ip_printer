@@ -35,7 +35,9 @@ constexpr uint32_t kChunkBufferSize = 4096;
 constexpr size_t kDrainChunkSize = 1024;
 constexpr size_t kDebugCommandMax = 96;
 constexpr size_t kDebugBytesPerPoll = 64;
-constexpr size_t kPrintBufferCapacity = 512 * 1024;  // 512KB read-ahead buffer
+constexpr size_t kPrintBufferCapacity = 512 * 1024;  // 512KB read-ahead buffer (PSRAM)
+constexpr size_t kHeapFallbackCapacity = 32 * 1024;   // conservative heap-only fallback
+constexpr size_t kHeapReserveBytes = 64 * 1024;       // minimum free heap to preserve
 constexpr uint32_t kBufferFlushTimeoutMs = 30000;
 constexpr size_t kPrefillBytes = 64 * 1024;           // pre-fill before USB drain starts
 constexpr uint32_t kPrefillTimeoutMs = 2000;           // max wait for pre-fill
@@ -71,6 +73,10 @@ struct PrintRingBuffer {
   volatile bool prefill_done = false;
   volatile uint32_t prefill_start_ms = 0;
 } printBuf;
+
+// Static TCP read buffer — avoids 4KB stack allocations in the main loop
+// that could overflow the Arduino task's 8KB stack.
+uint8_t tcpReadBuf[kChunkBufferSize];
 
 DeviceState currentState = DeviceState::Booting;
 WiFiServer printServer(kRawPrintPort);
@@ -333,16 +339,32 @@ size_t bufferUsed() {
 }
 
 bool initPrintBuffer() {
+  // Prefer PSRAM for the full-size buffer
   printBuf.ring.storage =
       static_cast<uint8_t *>(ps_malloc(kPrintBufferCapacity));
-  if (printBuf.ring.storage == nullptr) {
+  if (printBuf.ring.storage != nullptr) {
+    printBuf.ring.capacity = kPrintBufferCapacity;
+  } else {
+    // PSRAM unavailable — use a small heap buffer that leaves room for
+    // WiFi, TCP, and other runtime allocations.
+    const size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < kHeapReserveBytes + kHeapFallbackCapacity) {
+      Serial.printf("[BUFFER] Not enough heap for print buffer (free=%u, "
+                    "need=%u)\n",
+                    static_cast<unsigned>(freeHeap),
+                    static_cast<unsigned>(kHeapReserveBytes +
+                                          kHeapFallbackCapacity));
+      return false;
+    }
     printBuf.ring.storage =
-        static_cast<uint8_t *>(malloc(kPrintBufferCapacity));
+        static_cast<uint8_t *>(malloc(kHeapFallbackCapacity));
+    if (printBuf.ring.storage == nullptr) {
+      return false;
+    }
+    printBuf.ring.capacity = kHeapFallbackCapacity;
+    Serial.printf("[BUFFER] PSRAM unavailable, using %uKB heap fallback\n",
+                  static_cast<unsigned>(kHeapFallbackCapacity / 1024));
   }
-  if (printBuf.ring.storage == nullptr) {
-    return false;
-  }
-  printBuf.ring.capacity = kPrintBufferCapacity;
   printBuf.mutex = xSemaphoreCreateMutex();
   printBuf.data_ready = xSemaphoreCreateBinary();
   return printBuf.mutex != nullptr && printBuf.data_ready != nullptr;
@@ -356,15 +378,22 @@ void printBufferDrainTask(void *) {
 
     // Pre-fill gate: accumulate data before starting USB output so the
     // printer receives a steady stream instead of starving on WiFi jitter.
+    // Adapts to actual buffer size — if PSRAM was unavailable the buffer
+    // may be much smaller than kPrefillBytes.
     if (printBuf.job_active && !printBuf.prefill_done) {
       const size_t buffered = bufferUsed();
       const uint32_t elapsed = millis() - printBuf.prefill_start_ms;
-      if (buffered < kPrefillBytes && elapsed < kPrefillTimeoutMs) {
+      const size_t usable =
+          printBuf.ring.capacity > 0 ? printBuf.ring.capacity - 1 : 0;
+      const size_t effectivePrefill = min(kPrefillBytes, usable / 2);
+      // Start draining when: prefill reached, timeout, or buffer >75% full
+      if (buffered < effectivePrefill && elapsed < kPrefillTimeoutMs &&
+          buffered < usable * 3 / 4) {
         continue;
       }
       printBuf.prefill_done = true;
       Serial.printf("[BUFFER] Pre-fill %s (%u bytes in %lu ms)\n",
-                    buffered >= kPrefillBytes ? "reached" : "timed out",
+                    buffered >= effectivePrefill ? "reached" : "timed out",
                     static_cast<unsigned>(buffered), elapsed);
     }
 
@@ -461,16 +490,15 @@ void pollForClients() {
       // Check free space BEFORE reading so we never pull bytes from TCP
       // that we cannot store.
       if (activeClient) {
-        uint8_t residual[kChunkBufferSize];
         while (activeClient.available() > 0) {
           xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
           const size_t free = bufferFreeLocked();
           xSemaphoreGive(printBuf.mutex);
           if (free == 0) break;
-          const size_t toRead = min(sizeof(residual), free);
-          const int n = activeClient.read(residual, toRead);
+          const size_t toRead = min(sizeof(tcpReadBuf), free);
+          const int n = activeClient.read(tcpReadBuf, toRead);
           if (n <= 0) break;
-          bufferWrite(residual, static_cast<size_t>(n));
+          bufferWrite(tcpReadBuf, static_cast<size_t>(n));
           jobStats.bytesReceived += static_cast<size_t>(n);
         }
       }
@@ -517,7 +545,6 @@ void processPrintStream() {
     return;
   }
 
-  uint8_t buffer[kChunkBufferSize];
   bool sawPayload = false;
 
   while (activeClient.available() > 0) {
@@ -530,13 +557,13 @@ void processPrintStream() {
       break;  // Buffer full, let drain task catch up
     }
 
-    const size_t toRead = min(sizeof(buffer), free);
-    const int bytesRead = activeClient.read(buffer, toRead);
+    const size_t toRead = min(sizeof(tcpReadBuf), free);
+    const int bytesRead = activeClient.read(tcpReadBuf, toRead);
     if (bytesRead <= 0) {
       break;
     }
 
-    bufferWrite(buffer, static_cast<size_t>(bytesRead));
+    bufferWrite(tcpReadBuf, static_cast<size_t>(bytesRead));
 
     sawPayload = true;
     jobStats.bytesReceived += static_cast<size_t>(bytesRead);
@@ -615,13 +642,13 @@ void logHeartbeat() {
                   static_cast<unsigned>(usb.total_dropped_bytes),
                   static_cast<unsigned>(usb.failed_transfer_count),
                   static_cast<unsigned>(buf_used),
-                  static_cast<unsigned>(kPrintBufferCapacity / 1024));
+                  static_cast<unsigned>(printBuf.ring.capacity / 1024));
     return;
   }
 
   Serial.printf("[HEARTBEAT] state=%s mode=STA ip=%s rssi=%d usb_device=%s "
                 "usb_ready=%s vid=%04x pid=%04x out=0x%02x fwd=%u drop=%u "
-                "fail=%u buf=%u/%uK\n",
+                "fail=%u buf=%u/%uK heap=%u\n",
                 stateName(currentState), WiFi.localIP().toString().c_str(),
                 WiFi.RSSI(), usb.device_connected ? "yes" : "no",
                 usb.printer_ready ? "yes" : "no", usb.vendor_id,
@@ -630,7 +657,8 @@ void logHeartbeat() {
                 static_cast<unsigned>(usb.total_dropped_bytes),
                 static_cast<unsigned>(usb.failed_transfer_count),
                 static_cast<unsigned>(buf_used),
-                static_cast<unsigned>(kPrintBufferCapacity / 1024));
+                static_cast<unsigned>(printBuf.ring.capacity / 1024),
+                ESP.getFreeHeap());
 }
 
 void writeDebugPrompt(WiFiClient &client) { client.print(F("esp32-print> ")); }
@@ -700,7 +728,7 @@ void writeDebugStatus(WiFiClient &client) {
   client.print(F("buffer_used_bytes="));
   client.println(bufferUsed());
   client.print(F("buffer_capacity_bytes="));
-  client.println(kPrintBufferCapacity);
+  client.println(printBuf.ring.capacity);
   client.print(F("buffer_drain_error="));
   client.println(printBuf.drain_error ? F("true") : F("false"));
 }
@@ -790,7 +818,7 @@ void handleDebugCommand(WiFiClient &client, const char *rawCommand) {
     const size_t used = bufferUsed();
     client.printf("used=%u capacity=%u drain_error=%s job_active=%s\n",
                   static_cast<unsigned>(used),
-                  static_cast<unsigned>(kPrintBufferCapacity),
+                  static_cast<unsigned>(printBuf.ring.capacity),
                   printBuf.drain_error ? "yes" : "no",
                   printBuf.job_active ? "yes" : "no");
     return;
@@ -961,10 +989,11 @@ void setup() {
     setState(DeviceState::Error);
     return;
   }
-  Serial.printf("[BUFFER] %uKB read-ahead buffer allocated (%s)\n",
-                static_cast<unsigned>(kPrintBufferCapacity / 1024),
+  Serial.printf("[BUFFER] %uKB read-ahead buffer allocated (%s, heap_free=%u)\n",
+                static_cast<unsigned>(printBuf.ring.capacity / 1024),
                 printBuf.ring.storage >= (uint8_t *)0x3C000000 ? "PSRAM"
-                                                                           : "heap");
+                                                               : "heap",
+                ESP.getFreeHeap());
   xTaskCreatePinnedToCore(printBufferDrainTask, "buf_drain", 4096, nullptr, 10,
                           &printBuf.drain_task, 0);
   if (printBuf.drain_task == nullptr) {
