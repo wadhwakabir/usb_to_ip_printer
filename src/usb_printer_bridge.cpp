@@ -18,7 +18,7 @@ namespace {
 
 constexpr uint8_t kPrinterClassCode = USB_CLASS_PRINTER;
 constexpr bool kAllowDryRunWithoutPrinter = false;
-constexpr size_t kTransferBufferSize = 64;
+constexpr size_t kTransferBufferSize = 1024;
 constexpr TickType_t kTransferTimeoutTicks = pdMS_TO_TICKS(15000);
 
 struct BridgeState {
@@ -683,11 +683,7 @@ bool send_raw(const uint8_t *data, size_t length) {
   xSemaphoreTake(g_state.send_mutex, portMAX_DELAY);
   bool ok = true;
   size_t offset = 0;
-  size_t maxChunk =
-      g_state.out_endpoint_mps > 0 ? g_state.out_endpoint_mps : kTransferBufferSize;
-  if (maxChunk > kTransferBufferSize) {
-    maxChunk = kTransferBufferSize;
-  }
+  const size_t maxChunk = kTransferBufferSize;
   while (offset < length) {
     const size_t chunk = min(maxChunk, length - offset);
     if (!submit_transfer_locked(data + offset, chunk)) {
