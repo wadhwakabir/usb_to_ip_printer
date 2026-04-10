@@ -484,24 +484,9 @@ void finishJob(const char *reason, bool markComplete = true) {
 void pollForClients() {
   if (!activeClient || !activeClient.connected()) {
     if (jobStats.active) {
-      // Drain any residual TCP data into the ring buffer before finishing.
-      // connected() usually stays true while available()>0, but a safety
-      // drain here closes edge cases around simultaneous data+FIN arrival.
-      // Check free space BEFORE reading so we never pull bytes from TCP
-      // that we cannot store.
-      if (activeClient) {
-        while (activeClient.available() > 0) {
-          xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
-          const size_t free = bufferFreeLocked();
-          xSemaphoreGive(printBuf.mutex);
-          if (free == 0) break;
-          const size_t toRead = min(sizeof(tcpReadBuf), free);
-          const int n = activeClient.read(tcpReadBuf, toRead);
-          if (n <= 0) break;
-          bufferWrite(tcpReadBuf, static_cast<size_t>(n));
-          jobStats.bytesReceived += static_cast<size_t>(n);
-        }
-      }
+      // processPrintStream() already captured all reachable TCP data while
+      // _connected was still true.  connected() above has now poisoned that
+      // flag, so available()/read() would return 0 — no point retrying here.
       finishJob("client disconnected", jobStats.bytesReceived > 0);
     }
 
@@ -531,7 +516,15 @@ void pollForClients() {
 }
 
 void processPrintStream() {
-  if (!activeClient || !activeClient.connected()) {
+  // Guard: skip if no client or no active job.
+  // IMPORTANT: do NOT call activeClient.connected() here.  On ESP32 Arduino
+  // it probes the socket with recv(fd,&dummy,0,...) which can set the
+  // internal _connected flag to false when the peer has sent FIN, even when
+  // unread data remains in the TCP receive buffer.  Once _connected is
+  // false, available() and read() both short-circuit to 0/−1 and the
+  // remaining payload is silently lost.  Disconnect detection is handled
+  // exclusively by pollForClients() which runs AFTER this function.
+  if (!activeClient || !jobStats.active) {
     return;
   }
 
@@ -1008,11 +1001,17 @@ void setup() {
 void loop() {
   updateLed();
 
+  // processPrintStream() MUST run before pollForClients().
+  // pollForClients() probes the socket via connected(), which can set the
+  // WiFiClient's internal _connected flag to false on peer shutdown.  Once
+  // that flag is false, available() and read() short-circuit to 0/−1 and
+  // any unread TCP data is silently lost.  By reading first we capture the
+  // full payload while _connected is still true.
+  processPrintStream();
   pollForClients();
   if (currentState != DeviceState::Printing) {
     pollDebugServer();
   }
-  processPrintStream();
   restoreReadyStateIfNeeded();
   syncIdleStateWithPrinter();
   checkWifiConnection();
