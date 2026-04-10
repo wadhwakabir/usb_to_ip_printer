@@ -20,11 +20,16 @@ struct RingBuffer {
     return (head >= tail) ? (head - tail) : (capacity - tail + head);
   }
 
-  size_t free_space() const { return capacity - 1 - used(); }
+  size_t free_space() const {
+    if (capacity < 2) return 0;
+    return capacity - 1 - used();
+  }
 
   // Write up to `len` bytes.  Returns the number actually written (may be less
   // if the buffer is full or nearly full).
   size_t write(const uint8_t *data, size_t len) {
+    if (data == nullptr || len == 0 || storage == nullptr || capacity < 2)
+      return 0;
     const size_t avail = free_space();
     const size_t n = (len < avail) ? len : avail;
     if (n > 0) {
@@ -41,6 +46,8 @@ struct RingBuffer {
 
   // Read up to `max_len` bytes.  Returns the number actually read.
   size_t read(uint8_t *data, size_t max_len) {
+    if (data == nullptr || max_len == 0 || storage == nullptr || capacity < 2)
+      return 0;
     const size_t avail = used();
     const size_t n = (max_len < avail) ? max_len : avail;
     if (n > 0) {
