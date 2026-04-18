@@ -391,7 +391,11 @@ void printBufferDrainTask(void *) {
     while (printBuf.job_active && !printBuf.drain_error) {
       const size_t n = bufferRead(chunk, sizeof(chunk));
       if (n == 0) {
-        break;
+        // Buffer momentarily empty — wait for new data without leaving
+        // the drain loop.  Breaking out and re-entering via the outer
+        // semaphore adds ~10 ms dead time that shows up as stutter.
+        xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(1));
+        continue;
       }
       if (!usb_printer_bridge::send_raw(chunk, n)) {
         if (printBuf.job_generation == gen) {
