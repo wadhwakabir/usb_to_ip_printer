@@ -48,7 +48,6 @@ struct BridgeState {
   uint16_t vendor_id = 0;
   uint16_t product_id = 0;
   uint8_t interface_number = 0xff;
-  uint8_t alternate_setting = 0;
   uint8_t out_endpoint = 0;
   uint8_t in_endpoint = 0;
   uint16_t out_endpoint_mps = 0;
@@ -263,7 +262,6 @@ bool inspect_interfaces(usb_device_handle_t device_hdl) {
 
   xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
   g_state.interface_number = selected_interface;
-  g_state.alternate_setting = selected_alt;
   g_state.out_endpoint = selected_out;
   g_state.in_endpoint = selected_in;
   g_state.out_endpoint_mps = selected_mps;
@@ -289,7 +287,6 @@ void close_active_device() {
     g_state.vendor_id = 0;
     g_state.product_id = 0;
     g_state.interface_number = 0xff;
-    g_state.alternate_setting = 0;
     g_state.out_endpoint = 0;
     g_state.in_endpoint = 0;
     g_state.out_endpoint_mps = 0;
@@ -313,7 +310,6 @@ void close_active_device() {
   g_state.vendor_id = 0;
   g_state.product_id = 0;
   g_state.interface_number = 0xff;
-  g_state.alternate_setting = 0;
   g_state.out_endpoint = 0;
   g_state.in_endpoint = 0;
   g_state.out_endpoint_mps = 0;
@@ -683,7 +679,11 @@ bool send_raw(const uint8_t *data, size_t length) {
   xSemaphoreTake(g_state.send_mutex, portMAX_DELAY);
   bool ok = true;
   size_t offset = 0;
-  const size_t maxChunk = kTransferBufferSize;
+  size_t maxChunk =
+      g_state.out_endpoint_mps > 0 ? g_state.out_endpoint_mps : kTransferBufferSize;
+  if (maxChunk > kTransferBufferSize) {
+    maxChunk = kTransferBufferSize;
+  }
   while (offset < length) {
     const size_t chunk = min(maxChunk, length - offset);
     if (!submit_transfer_locked(data + offset, chunk)) {

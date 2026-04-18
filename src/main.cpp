@@ -87,7 +87,6 @@ bool startedAsAccessPoint = false;
 uint32_t stateChangedAtMs = 0;
 uint32_t lastHeartbeatAtMs = 0;
 uint32_t lastWifiLogAtMs = 0;
-uint32_t lastProgressLogAtMs = 0;
 uint32_t bootedAtMs = 0;
 char debugCommandBuffer[kDebugCommandMax] = {0};
 size_t debugCommandLength = 0;
@@ -302,8 +301,6 @@ void startDebugServer() {
 // The main loop writes TCP data in, a FreeRTOS drain task sends it to USB.
 // This eliminates printer starvation caused by network round-trip latency.
 
-size_t bufferUsedLocked() { return printBuf.ring.used(); }
-
 size_t bufferFreeLocked() { return printBuf.ring.free_space(); }
 
 size_t bufferWrite(const uint8_t *data, size_t len) {
@@ -373,7 +370,7 @@ bool initPrintBuffer() {
 void printBufferDrainTask(void *) {
   uint8_t chunk[kDrainChunkSize];
   for (;;) {
-    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(1));
+    xSemaphoreTake(printBuf.data_ready, pdMS_TO_TICKS(10));
     const uint32_t gen = printBuf.job_generation;
 
     // Pre-fill gate: accumulate data before starting USB output so the
@@ -397,19 +394,26 @@ void printBufferDrainTask(void *) {
                     static_cast<unsigned>(buffered), elapsed);
     }
 
+    size_t burst = 0;
     while (printBuf.job_active && !printBuf.drain_error) {
       const size_t n = bufferRead(chunk, sizeof(chunk));
       if (n == 0) {
         break;
       }
       if (!usb_printer_bridge::send_raw(chunk, n)) {
-        // Only report error if still the same job — a stale failure from
-        // a previous job must not poison the next one.
         if (printBuf.job_generation == gen) {
           printBuf.drain_error = true;
           Serial.printf("[BUFFER] USB drain failed: %s\n",
                         usb_printer_bridge::last_error());
         }
+      }
+      burst += n;
+      // Yield after every 8 KB so the printer's internal buffer can drain.
+      // Without this pause the host can outrun the print engine, causing
+      // the printer to silently drop raster lines.
+      if (burst >= 8 * 1024) {
+        burst = 0;
+        vTaskDelay(pdMS_TO_TICKS(5));
       }
     }
   }
@@ -450,8 +454,6 @@ void beginJob(WiFiClient &client) {
   jobStats.chunksReceived = 0;
   jobStats.startedAtMs = millis();
   jobStats.lastDataAtMs = jobStats.startedAtMs;
-  lastProgressLogAtMs = 0;
-
   setState(DeviceState::ClientConnected);
   Serial.printf("[CLIENT] Connected from %s:%u\n",
                 client.remoteIP().toString().c_str(), client.remotePort());
@@ -570,7 +572,6 @@ void processPrintStream() {
     }
     setState(DeviceState::Printing);
 
-    lastProgressLogAtMs = millis();
   }
 
   const uint32_t idleTimeoutMs =
@@ -696,6 +697,10 @@ void writeDebugStatus(WiFiClient &client) {
   client.println(usb.printer_ready ? F("true") : F("false"));
   client.print(F("usb_backend_faulted="));
   client.println(usb.backend_faulted ? F("true") : F("false"));
+  client.print(F("usb_dry_run_mode="));
+  client.println(usb.dry_run_mode ? F("true") : F("false"));
+  client.print(F("usb_device_address="));
+  client.println(usb.device_address);
   client.print(F("usb_vendor_id="));
   client.printf("%04x\n", usb.vendor_id);
   client.print(F("usb_product_id="));
