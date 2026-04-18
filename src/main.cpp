@@ -297,12 +297,6 @@ void startDebugServer() {
                 kDebugPort);
 }
 
-// --- Print read-ahead buffer: decouples TCP receive from USB send ---
-// The main loop writes TCP data in, a FreeRTOS drain task sends it to USB.
-// This eliminates printer starvation caused by network round-trip latency.
-
-size_t bufferFreeLocked() { return printBuf.ring.free_space(); }
-
 size_t bufferWrite(const uint8_t *data, size_t len) {
   xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
   const size_t n = printBuf.ring.write(data, len);
@@ -394,7 +388,6 @@ void printBufferDrainTask(void *) {
                     static_cast<unsigned>(buffered), elapsed);
     }
 
-    size_t burst = 0;
     while (printBuf.job_active && !printBuf.drain_error) {
       const size_t n = bufferRead(chunk, sizeof(chunk));
       if (n == 0) {
@@ -406,14 +399,6 @@ void printBufferDrainTask(void *) {
           Serial.printf("[BUFFER] USB drain failed: %s\n",
                         usb_printer_bridge::last_error());
         }
-      }
-      burst += n;
-      // Yield after every 8 KB so the printer's internal buffer can drain.
-      // Without this pause the host can outrun the print engine, causing
-      // the printer to silently drop raster lines.
-      if (burst >= 8 * 1024) {
-        burst = 0;
-        vTaskDelay(pdMS_TO_TICKS(5));
       }
     }
   }
@@ -545,7 +530,7 @@ void processPrintStream() {
   while (activeClient.available() > 0) {
     // Check how much buffer space is free before reading from TCP
     xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
-    const size_t free = bufferFreeLocked();
+    const size_t free = printBuf.ring.free_space();
     xSemaphoreGive(printBuf.mutex);
 
     if (free == 0) {
@@ -571,7 +556,6 @@ void processPrintStream() {
       Serial.println("[JOB] Receiving RAW print data");
     }
     setState(DeviceState::Printing);
-
   }
 
   const uint32_t idleTimeoutMs =
@@ -697,10 +681,6 @@ void writeDebugStatus(WiFiClient &client) {
   client.println(usb.printer_ready ? F("true") : F("false"));
   client.print(F("usb_backend_faulted="));
   client.println(usb.backend_faulted ? F("true") : F("false"));
-  client.print(F("usb_dry_run_mode="));
-  client.println(usb.dry_run_mode ? F("true") : F("false"));
-  client.print(F("usb_device_address="));
-  client.println(usb.device_address);
   client.print(F("usb_vendor_id="));
   client.printf("%04x\n", usb.vendor_id);
   client.print(F("usb_product_id="));
