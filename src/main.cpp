@@ -1508,11 +1508,14 @@ void setup() {
     return;
   }
 
-  xTaskCreatePinnedToCore(usbRecvTask, "usb_recv", 4096, nullptr, 8,
-                          &printBuf.recv_task, 1);
-  if (printBuf.recv_task == nullptr) {
-    Serial.println("[WARN] USB receive task creation failed (bidirectional disabled)");
-  }
+  // Bidirectional USB recv disabled: the Canon G1010 driver expects a
+  // unidirectional raw socket.  Writing unsolicited IN-endpoint bytes back
+  // to the TCP client confuses the driver and causes jobs to be dropped.
+  // xTaskCreatePinnedToCore(usbRecvTask, "usb_recv", 4096, nullptr, 8,
+  //                         &printBuf.recv_task, 1);
+  // if (printBuf.recv_task == nullptr) {
+  //   Serial.println("[WARN] USB receive task creation failed (bidirectional disabled)");
+  // }
 
   startPrintServer();
   startDebugServer();
