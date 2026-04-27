@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print Bridge - Setup Guide</title>
+<style>
+  @page {
+    size: A4;
+    margin: 8mm 10mm;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1a1a2e;
+    background: #f8f9fc;
+    line-height: 1.35;
+    width: 210mm;
+    height: 297mm;
+    margin: 0 auto;
+    padding: 8mm 12mm;
+    font-size: 10.5pt;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .hero {
+    text-align: center;
+    padding: 0.8rem 0.5rem;
+    margin-bottom: 0.6rem;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 10px;
+    color: #fff;
+  }
+  .hero h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.5px; }
+  .hero p { font-size: 0.9rem; opacity: 0.9; margin-top: 0.1rem; }
+  h2 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #667eea;
+    margin-top: 0.6rem;
+    margin-bottom: 0.3rem;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  h2 .num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.4rem;
+    height: 1.4rem;
+    background: #667eea;
+    color: #fff;
+    border-radius: 50%;
+    font-size: 0.7rem;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .card {
+    background: #fff;
+    border-radius: 8px;
+    padding: 0.5rem 0.8rem;
+    margin-bottom: 0.3rem;
+    border: 1px solid #e8ecf4;
+  }
+  .card p, .card li { font-size: 9.5pt; }
+  ol, ul { padding-left: 1.3rem; }
+  li { margin-bottom: 0.2rem; }
+  .credential {
+    display: inline-block;
+    background: #f0f1ff;
+    color: #4a4ebb;
+    font-family: "SF Mono", "Fira Code", Consolas, monospace;
+    font-size: 9.5pt;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .led-table { width: 100%; border-collapse: collapse; }
+  .led-table td {
+    text-align: left;
+    padding: 0.18rem 0.4rem;
+    font-size: 9pt;
+    border-bottom: 1px solid #f0f2f7;
+  }
+  .dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 0.3rem;
+    vertical-align: middle;
+  }
+  .dot-purple { background: #a855f7; }
+  .dot-green  { background: #22c55e; }
+  .dot-orange { background: #f59e0b; }
+  .dot-red    { background: #ef4444; }
+  .dot-yellow { background: #eab308; }
+  .dot-blue   { background: #3b82f6; }
+  .dot-white  { background: #e5e7eb; border: 1px solid #ccc; }
+  .dot-cyan   { background: #06b6d4; }
+  .columns {
+    display: flex;
+    gap: 0.7rem;
+  }
+  .col {
+    flex: 1;
+    background: #fff;
+    border: 1px solid #e8ecf4;
+    border-radius: 8px;
+    padding: 0.45rem 0.75rem;
+  }
+  .col h3 {
+    font-size: 9.5pt;
+    font-weight: 700;
+    margin-bottom: 0.25rem;
+    color: #333;
+    padding-bottom: 0.2rem;
+    border-bottom: 2px solid #667eea;
+  }
+  .col ol { font-size: 9pt; }
+  .col li { margin-bottom: 0.15rem; }
+  .note {
+    background: #fffbeb;
+    border-left: 3px solid #f59e0b;
+    padding: 0.25rem 0.5rem;
+    border-radius: 0 6px 6px 0;
+    font-size: 8.5pt;
+    color: #92400e;
+    margin-top: 0.3rem;
+  }
+  .troubleshooting {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.3rem;
+  }
+  .trouble-item {
+    background: #fff;
+    border: 1px solid #e8ecf4;
+    border-radius: 6px;
+    padding: 0.35rem 0.55rem;
+  }
+  .trouble-item strong {
+    font-size: 9pt;
+    display: block;
+    margin-bottom: 0.1rem;
+    color: #333;
+  }
+  .trouble-item p {
+    font-size: 8.5pt;
+    color: #555;
+    line-height: 1.3;
+  }
+  .footer {
+    text-align: center;
+    margin-top: auto;
+    padding-top: 0.6rem;
+    border-top: 1px solid #e8ecf4;
+    font-size: 8pt;
+    color: #aaa;
+  }
+  .two-col-bottom {
+    display: flex;
+    gap: 0.7rem;
+    margin-top: 0.6rem;
+    flex: 1;
+  }
+  .two-col-bottom > div { flex: 1; }
+  @media print {
+    body { background: #fff; padding: 0; width: auto; height: auto; overflow: visible; box-shadow: none; }
+    .card, .col, .trouble-item { box-shadow: none; }
+  }
+  @media screen {
+    body { box-shadow: 0 0 30px rgba(0,0,0,0.1); }
+  }
+  @media screen and (max-width: 700px) {
+    body { width: auto; height: auto; padding: 1rem; box-shadow: none; overflow: visible; }
+    .columns { flex-direction: column; }
+    .two-col-bottom { flex-direction: column; }
+    .troubleshooting { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Print Bridge</h1>
+  <p>Your USB printer, now wireless. One-time setup, then just print.</p>
+</div>
+
+<h2><span class="num">1</span> Plug it in</h2>
+<div class="card">
+  <ol>
+    <li>Connect the <strong>USB cable</strong> from the bridge's HOST port to your printer.</li>
+    <li>Turn the printer <strong>on</strong>, then plug in the bridge's <strong>power cable</strong> (USB-C).</li>
+  </ol>
+  <p style="margin-top:0.25rem">Light blinks <span class="dot dot-purple"></span><strong>purple</strong> = ready for Wi-Fi setup.</p>
+</div>
+
+<h2><span class="num">2</span> Connect to Wi-Fi <span style="font-weight:400;font-size:8pt;color:#888">(from your phone)</span></h2>
+<div class="card">
+  <ol>
+    <li>On your phone, join Wi-Fi: <span class="credential">esp32-printer</span> &nbsp; password: <span class="credential">printprint</span></li>
+    <li>A "Sign in to network" page pops up. If not, go to <span class="credential">http://192.168.4.1</span></li>
+    <li>Pick <strong>your home Wi-Fi</strong>, enter password, tap <strong>Save &amp; reboot</strong>.</li>
+  </ol>
+  <p style="margin-top:0.25rem">Bridge restarts &rarr; light turns <span class="dot dot-green"></span><strong>solid green</strong> = connected. <em>You only do this once.</em></p>
+</div>
+
+<h2><span class="num">3</span> Add printer to your computer</h2>
+<div class="columns">
+  <div class="col">
+    <h3>macOS</h3>
+    <ol>
+      <li><strong>System Settings &rarr; Printers &amp; Scanners &rarr; +</strong></li>
+      <li>IP tab &rarr; Address: <span class="credential">esp32-printer.local</span></li>
+      <li>Protocol: <strong>HP Jetdirect &ndash; Socket</strong></li>
+      <li>Use: <em>your printer model</em> &rarr; <strong>Add</strong></li>
+    </ol>
+  </div>
+  <div class="col">
+    <h3>Windows 10 / 11</h3>
+    <ol>
+      <li><strong>Settings &rarr; Printers &amp; scanners &rarr; Add manually</strong></li>
+      <li>"Add using TCP/IP address or hostname"</li>
+      <li>Hostname: <span class="credential">esp32-printer.local</span></li>
+      <li>Protocol: <strong>Raw</strong> &nbsp; Port: <strong>9100</strong> &rarr; pick driver</li>
+    </ol>
+  </div>
+</div>
+<div class="note">
+  If <span class="credential">esp32-printer.local</span> doesn't work, check your router's device list for <em>esp32-printer</em> and use its IP address.
+</div>
+
+<h2><span class="num">4</span> Print!</h2>
+<div class="card">
+  <p>Done. Print from any app &mdash; pick the printer you just added.</p>
+</div>
+
+<div class="two-col-bottom">
+  <div>
+    <h2 style="margin-top:0; color:#333">LED Reference</h2>
+    <div class="card" style="padding:0.3rem 0.4rem">
+      <table class="led-table">
+        <tr><td><span class="dot dot-white"></span> White</td><td>Starting up</td></tr>
+        <tr><td><span class="dot dot-blue"></span> Blue blink</td><td>Connecting to Wi-Fi</td></tr>
+        <tr><td><span class="dot dot-purple"></span> Purple blink</td><td>Setup mode (needs credentials)</td></tr>
+        <tr><td><span class="dot dot-orange"></span> Orange blink</td><td>On Wi-Fi, no printer (check USB)</td></tr>
+        <tr><td><span class="dot dot-green"></span> Green solid</td><td>Ready to print</td></tr>
+        <tr><td><span class="dot dot-cyan"></span> Cyan solid</td><td>Computer connected</td></tr>
+        <tr><td><span class="dot dot-yellow"></span> Yellow blink</td><td>Printing</td></tr>
+        <tr><td><span class="dot dot-green"></span> Green blink</td><td>Job done</td></tr>
+        <tr><td><span class="dot dot-red"></span> Red blink</td><td>Error</td></tr>
+      </table>
+    </div>
+  </div>
+  <div>
+    <h2 style="margin-top:0; color:#333">Troubleshooting</h2>
+    <div class="troubleshooting">
+      <div class="trouble-item">
+        <strong><span class="dot dot-purple"></span> Purple won't stop</strong>
+        <p>Reconnect to <span class="credential">esp32-printer</span> and re-enter password.</p>
+      </div>
+      <div class="trouble-item">
+        <strong><span class="dot dot-orange"></span> Stuck orange</strong>
+        <p>Check USB cable is seated. Printer on? Wait 30-60s.</p>
+      </div>
+      <div class="trouble-item">
+        <strong><span class="dot dot-red"></span> Red blink</strong>
+        <p>Turn printer off/on, reseat USB, try again.</p>
+      </div>
+      <div class="trouble-item">
+        <strong>New house?</strong>
+        <p>Just plug in. Purple returns &rarr; do Step 2 with new Wi-Fi.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  Print Bridge &middot; Setup Guide &middot; Keep this page for reference
+</div>
+
+</body>
+</html>
