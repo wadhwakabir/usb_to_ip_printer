@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+.pio/
+.vscode/
+compile_commands.json
+include/network_config.h
+*.md
+Makefile
+docker-compose.yml
+Dockerfile
+.dockerignore

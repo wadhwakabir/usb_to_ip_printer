@@ -1,0 +1,28 @@
+services:
+
+  # Run native unit tests in a container.
+  #   docker compose run --rm tests
+  tests:
+    build:
+      context: .
+      target: test
+    command: pio test -e native-tests -v
+
+  # Build the firmware for esp32-s3-n16r8.
+  # The generated firmware.bin lands in ./.pio/build/esp32-s3-n16r8/ on the host
+  # thanks to the volume mount below.
+  #   docker compose run --rm build
+  build:
+    build:
+      context: .
+      target: build
+    command: pio run -e esp32-s3-n16r8
+    volumes:
+      # Share sources so edits are picked up without rebuilding the image
+      - ./src:/project/src
+      - ./include:/project/include
+      - ./boards:/project/boards
+      - ./partitions:/project/partitions
+      - ./platformio.ini:/project/platformio.ini
+      # Persist build artefacts + toolchain cache back to host
+      - ./.pio:/project/.pio
