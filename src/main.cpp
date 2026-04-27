@@ -490,10 +490,10 @@ void handleCaptiveProbe() {
 }
 
 void handleAndroidGenerate204() {
+  httpServer.sendHeader("Location", "http://192.168.4.1/");
+  httpServer.sendHeader("Cache-Control", "no-store");
   httpServer.sendHeader("Connection", "close");
-  httpServer.send(200, "text/html",
-                  F("<html><head><meta http-equiv=\"refresh\" "
-                    "content=\"0;url=http://192.168.4.1/\"></head></html>"));
+  httpServer.send(302, "text/plain", "");
 }
 
 void startCaptivePortal() {
@@ -533,7 +533,14 @@ void pollCaptivePortal() {
     return;
   }
   dnsServer.processNextRequest();
-  httpServer.handleClient();
+  // Handle multiple queued HTTP clients per loop iteration.  Samsung phones
+  // (and some other Android vendors) fire several probe requests back-to-back;
+  // only calling handleClient() once per loop() leaves subsequent requests
+  // waiting up to HTTP_MAX_DATA_WAIT (5s) each, causing the portal page to
+  // appear to hang.
+  for (int i = 0; i < 4; ++i) {
+    httpServer.handleClient();
+  }
 }
 
 void startPrintServer() {
