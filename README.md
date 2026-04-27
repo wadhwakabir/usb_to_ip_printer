@@ -75,8 +75,8 @@ make monitor                       # watch it boot
 No config files to edit. Every unit flashes identical. After flash, the device
 brings up its own Wi-Fi (`esp32-printer` / `printprint`) with a captive
 portal — the end user enters their home SSID/password from a phone browser,
-and the device stores them in NVS. See `setup.txt` for the end-user guide you
-can ship alongside the hardware.
+and the device stores them in NVS. See `setup.html` for the end-user guide you
+can print or ship alongside the hardware.
 
 `make help` shows all available targets. `make doctor` checks your environment
 and lists available USB serial ports.
@@ -377,5 +377,5 @@ Dockerfile                    # Containerized native test runner
 docker-compose.yml            # Docker Compose service for tests
 CanonIJG1000series.ppd.gz     # Canon G1010 PPD for CUPS
 platformio.ini                # Build configuration (esp32-s3-n16r8 + native-tests)
-setup.txt                     # End-user setup guide to ship with the device
+setup.html                    # End-user setup guide to print or ship with device
 ```
