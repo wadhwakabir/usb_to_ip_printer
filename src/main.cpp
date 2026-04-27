@@ -424,14 +424,15 @@ String renderPortalPage(const String &message) {
   page += F(
       "\"></label>"
       "<label>Password</label>"
-      "<div style=\"position:relative\">"
-      "<input id=\"pw\" name=\"pass\" type=\"password\" style=\"padding-right:2.5em\">"
-      "<button type=\"button\" onclick=\"var p=document.getElementById('pw');"
+      "<div style=\"position:relative;display:flex;align-items:center\">"
+      "<input id=\"pw\" name=\"pass\" type=\"password\" "
+      "style=\"flex:1;padding-right:2.2em\">"
+      "<span onclick=\"var p=document.getElementById('pw');"
       "p.type=p.type==='password'?'text':'password';"
-      "this.textContent=p.type==='password'?'\xF0\x9F\x91\x81':'\\u2715'\" "
-      "style=\"position:absolute;right:.5em;top:50%;transform:translateY(-50%);"
-      "background:none;border:none;font-size:1.2em;cursor:pointer;padding:0\">"
-      "\xF0\x9F\x91\x81</button></div>"
+      "this.textContent=p.type==='password'?'\\u25CE':'\\u25C9'\" "
+      "style=\"position:absolute;right:.6em;cursor:pointer;"
+      "font-size:1.3em;user-select:none;color:#555\">"
+      "&#x25CE;</span></div>"
       "<div class=\"hint\">The printer will reboot and try to join this "
       "network. If it can't, it will re-open this setup page.</div>"
       "<button type=\"submit\">Save &amp; reboot</button></form>");
@@ -482,8 +483,10 @@ void handlePortalSave() {
 // automatically, so the non-technical user doesn't have to type an IP.
 void handleCaptiveProbe() {
   httpServer.sendHeader("Location", "http://192.168.4.1/");
+  httpServer.sendHeader("Cache-Control", "no-store");
   httpServer.sendHeader("Connection", "close");
-  httpServer.send(302, "text/plain", "");
+  httpServer.send(302, "text/html",
+                  F("<html><body><a href=\"http://192.168.4.1/\">Setup</a></body></html>"));
 }
 
 void handleAndroidGenerate204() {
