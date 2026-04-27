@@ -47,9 +47,14 @@ struct BridgeState {
   bool backend_faulted = false;
   bool dry_run_mode = kAllowDryRunWithoutPrinter;
 
-  bool new_device_pending = false;
+  // Small FIFO of device addresses announced by USB_HOST_CLIENT_EVENT_NEW_DEV
+  // that the client task has not yet opened.  A single-slot design would lose
+  // events when a hub enumerates multiple devices back-to-back: the callback
+  // runs in USB-lib context and cannot block, so we must queue here.
+  static constexpr size_t kPendingDeviceCapacity = 4;
+  uint8_t pending_device_addrs[kPendingDeviceCapacity] = {0};
+  size_t pending_device_count = 0;
   bool device_gone_pending = false;
-  uint8_t pending_device_address = 0;
 
   uint8_t device_address = 0;
   uint16_t vendor_id = 0;
@@ -328,10 +333,17 @@ void close_active_device() {
   g_state.printer_ready = false;
   xSemaphoreGive(g_state.state_mutex);
 
-  // Wait for any in-flight IN transfer to complete before releasing the
-  // interface and closing the device.  The transfer has a timeout set by
-  // the caller, so it will eventually complete or error out; we add a
-  // bounded wait here to avoid blocking indefinitely.
+  // Serialize with recv_raw() via in_mutex.  Clearing printer_ready alone is
+  // not enough: a recv_raw() that already passed its printer_ready check and
+  // captured dev_hdl can race forward to usb_host_transfer_submit() on a
+  // handle we're about to close.  Taking in_mutex blocks new recv_raw()
+  // callers, and since recv_raw() holds in_mutex across its submit+wait, we
+  // are guaranteed no transfer is in flight once the take succeeds.
+  xSemaphoreTake(g_state.in_mutex, portMAX_DELAY);
+
+  // Even under in_mutex the callback could set in_transfer_in_flight=false
+  // slightly before the USB stack has fully released the transfer buffer.
+  // Keep the bounded wait as a belt-and-braces check.
   if (g_state.in_transfer_in_flight) {
     Serial.println("[USB] Waiting for in-flight IN transfer to finish");
     for (int i = 0; i < 20 && g_state.in_transfer_in_flight; ++i) {
@@ -365,6 +377,8 @@ void close_active_device() {
   g_state.transfer_in_flight = false;
   set_last_error_locked("USB printer disconnected");
   xSemaphoreGive(g_state.state_mutex);
+
+  xSemaphoreGive(g_state.in_mutex);
 }
 
 void handle_new_device(uint8_t device_address) {
@@ -435,12 +449,32 @@ void client_event_callback(const usb_host_client_event_msg_t *event_msg,
                            void *arg) {
   (void)arg;
   switch (event_msg->event) {
-    case USB_HOST_CLIENT_EVENT_NEW_DEV:
+    case USB_HOST_CLIENT_EVENT_NEW_DEV: {
       xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
-      g_state.new_device_pending = true;
-      g_state.pending_device_address = event_msg->new_dev.address;
+      const uint8_t addr = event_msg->new_dev.address;
+      // Skip if this address is already queued (defensive: the USB host lib
+      // should not double-announce, but treat the queue as a set).
+      bool already_queued = false;
+      for (size_t i = 0; i < g_state.pending_device_count; ++i) {
+        if (g_state.pending_device_addrs[i] == addr) {
+          already_queued = true;
+          break;
+        }
+      }
+      if (!already_queued) {
+        if (g_state.pending_device_count <
+            BridgeState::kPendingDeviceCapacity) {
+          g_state.pending_device_addrs[g_state.pending_device_count++] = addr;
+        } else {
+          // Queue full — drop and log later via client task.  Set a last_error
+          // so the user can see it in the debug console.
+          set_last_error_locked(
+              "Dropped NEW_DEV event (addr=%u): pending queue full", addr);
+        }
+      }
       xSemaphoreGive(g_state.state_mutex);
       break;
+    }
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
       xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
       g_state.device_gone_pending = true;
@@ -503,14 +537,14 @@ void usb_client_task(void *arg) {
                     esp_err_to_name(err));
     }
 
-    bool should_open = false;
     bool should_close = false;
     uint8_t device_address = 0;
+    bool have_pending_open = false;
 
     xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
-    if (g_state.new_device_pending) {
-      should_open = true;
-      device_address = g_state.pending_device_address;
+    if (g_state.pending_device_count > 0) {
+      device_address = g_state.pending_device_addrs[0];
+      have_pending_open = true;
     }
     if (g_state.device_gone_pending) {
       should_close = true;
@@ -530,17 +564,49 @@ void usb_client_task(void *arg) {
         xSemaphoreGive(g_state.state_mutex);
         xSemaphoreGive(g_state.send_mutex);
       } else {
-        should_open = false;
+        have_pending_open = false;
       }
     }
 
-    if (should_open) {
+    if (have_pending_open) {
       handle_new_device(device_address);
+      // Pop the address we just handled (FIFO shift).  handle_new_device()
+      // may have ignored the device if one was already managed, but either
+      // way we've consumed the event.
       xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
-      g_state.new_device_pending = false;
+      if (g_state.pending_device_count > 0 &&
+          g_state.pending_device_addrs[0] == device_address) {
+        for (size_t i = 1; i < g_state.pending_device_count; ++i) {
+          g_state.pending_device_addrs[i - 1] = g_state.pending_device_addrs[i];
+        }
+        g_state.pending_device_count--;
+      }
       xSemaphoreGive(g_state.state_mutex);
     }
   }
+}
+
+// State updates from the OUT path run while holding send_mutex, but
+// get_status()/is_faulted()/is_ready() read the same fields under
+// state_mutex.  Funnel counter and fault writes through these helpers so the
+// two lock domains agree on what a reader sees.
+void record_transfer_success_locked(size_t length) {
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  g_state.total_forwarded_bytes += length;
+  g_state.backend_faulted = false;
+  set_printer_ready_message_locked();
+  xSemaphoreGive(g_state.state_mutex);
+}
+
+void record_transfer_failure(const char *fmt, ...) {
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  g_state.failed_transfer_count += 1;
+  g_state.backend_faulted = true;
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(g_state.last_error, sizeof(g_state.last_error), fmt, args);
+  va_end(args);
+  xSemaphoreGive(g_state.state_mutex);
 }
 
 bool submit_transfer_locked(const uint8_t *data, size_t length) {
@@ -555,9 +621,7 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
 
   usb_transfer_t *transfer = g_state.out_transfer;
   if (g_state.transfer_in_flight) {
-    g_state.failed_transfer_count += 1;
-    g_state.backend_faulted = true;
-    set_last_error("USB transfer is still in flight");
+    record_transfer_failure("USB transfer is still in flight");
     return false;
   }
 
@@ -578,17 +642,14 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
   if (err != ESP_OK) {
     g_state.transfer_in_flight = false;
     Serial.printf("[USB] Transfer submit failed: %s\n", esp_err_to_name(err));
-    g_state.failed_transfer_count += 1;
-    g_state.backend_faulted = true;
-    set_last_error("USB transfer submit failed: %s", esp_err_to_name(err));
+    record_transfer_failure("USB transfer submit failed: %s",
+                            esp_err_to_name(err));
     return false;
   }
 
   if (xSemaphoreTake(g_state.transfer_done, kTransferTimeoutTicks) != pdTRUE) {
     Serial.println("[USB] Transfer timed out waiting for completion");
-    g_state.failed_transfer_count += 1;
-    g_state.backend_faulted = true;
-    set_last_error("USB transfer completion timed out");
+    record_transfer_failure("USB transfer completion timed out");
     recover_endpoint_locked("timeout");
     return false;
   }
@@ -599,18 +660,14 @@ bool submit_transfer_locked(const uint8_t *data, size_t length) {
                   g_state.last_transfer_status,
                   g_state.last_transfer_actual_num_bytes,
                   static_cast<unsigned>(length));
-    g_state.failed_transfer_count += 1;
-    g_state.backend_faulted = true;
-    set_last_error("USB transfer failed status=%d actual=%d",
-                   g_state.last_transfer_status,
-                   g_state.last_transfer_actual_num_bytes);
+    record_transfer_failure("USB transfer failed status=%d actual=%d",
+                            g_state.last_transfer_status,
+                            g_state.last_transfer_actual_num_bytes);
     recover_endpoint_locked("transfer error");
     return false;
   }
 
-  g_state.total_forwarded_bytes += length;
-  g_state.backend_faulted = false;
-  set_printer_ready_message_locked();
+  record_transfer_success_locked(length);
   return true;
 }
 
@@ -695,6 +752,16 @@ bool is_faulted() {
   faulted = g_state.backend_faulted;
   xSemaphoreGive(g_state.state_mutex);
   return faulted;
+}
+
+bool is_ready_and_healthy() {
+  if (g_state.state_mutex == nullptr) {
+    return false;
+  }
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  const bool ok = g_state.printer_ready && !g_state.backend_faulted;
+  xSemaphoreGive(g_state.state_mutex);
+  return ok;
 }
 
 bool send_raw(const uint8_t *data, size_t length) {

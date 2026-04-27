@@ -419,11 +419,18 @@ void printBufferDrainTask(void *) {
 
 void usbRecvTask(void *) {
   uint8_t buf[512];
+  // Tracks how long the TCP send buffer has been too full to accept bytes.
+  // A stalled peer (not reading the socket) would otherwise block
+  // activeClient.write() indefinitely, wedging this task and causing
+  // finishJob()'s quiesce wait to always time out.
+  uint32_t stall_started_ms = 0;
+  constexpr uint32_t kRecvWriteStallAbortMs = 3000;
   for (;;) {
     // Only run when the main loop has explicitly activated recv for this job.
     // recv_active is set in beginJob() and cleared in finishJob() before
     // activeClient is touched, avoiding race conditions with the main loop.
     if (!printBuf.recv_active || printBuf.drain_error) {
+      stall_started_ms = 0;
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
@@ -438,16 +445,46 @@ void usbRecvTask(void *) {
       // already bailed out — never a stale activeClient from mid-write.
       printBuf.recv_in_flight = true;
       if (printBuf.recv_active) {
-        activeClient.write(buf, static_cast<size_t>(n));
+        // Only push what fits in the TCP send buffer right now.  write() on
+        // ESP32 Arduino can block when the LwIP send buffer is full; if the
+        // peer stopped reading, that block is open-ended and finishJob()'s
+        // 250 ms quiesce wait always expires.  Bounding by availableForWrite
+        // turns the block into a short loop we can bail out of.
+        const int avail = activeClient.availableForWrite();
+        if (avail > 0) {
+          const size_t to_write =
+              static_cast<size_t>(n) < static_cast<size_t>(avail)
+                  ? static_cast<size_t>(n)
+                  : static_cast<size_t>(avail);
+          activeClient.write(buf, to_write);
+          stall_started_ms = 0;
+        } else {
+          // Peer is not draining the socket.  Start / continue the stall
+          // timer; abort the socket if it persists, so the main loop sees
+          // a disconnect and finishJob() can run cleanly.
+          if (stall_started_ms == 0) {
+            stall_started_ms = millis();
+          } else if (millis() - stall_started_ms > kRecvWriteStallAbortMs) {
+            Serial.println("[RECV] TCP send buffer stalled; aborting client");
+            activeClient.stop();
+            stall_started_ms = 0;
+          }
+        }
       }
       printBuf.recv_in_flight = false;
     } else if (n < 0) {
       // recv_raw returned an error (device gone, no IN endpoint, etc.).
       // Avoid busy-spinning — pause before retrying.
+      stall_started_ms = 0;
       vTaskDelay(pdMS_TO_TICKS(50));
+    } else {
+      // n == 0: timeout, nothing to write — reset stall tracker.
+      stall_started_ms = 0;
     }
   }
 }
+
+void pollDebugServer();
 
 void flushPrintBuffer() {
   printBuf.prefill_done = true;  // force drain even if below watermark
@@ -463,10 +500,12 @@ void flushPrintBuffer() {
     }
     xSemaphoreGive(printBuf.data_ready);
 
-    // Keep the LED alive and reject stray clients while we wait.  The main
-    // loop is blocked here, so without this the device appears frozen for
-    // the full flush window if the USB side stalls.
+    // Keep the LED alive, service the debug console, and reject stray clients
+    // while we wait.  The main loop is blocked here, so without this the
+    // device appears frozen for the full flush window if the USB side stalls
+    // — which defeats the whole point of having a debug console.
     updateLed();
+    pollDebugServer();
     WiFiClient extra = printServer.available();
     if (extra) {
       extra.println("BUSY");
@@ -500,16 +539,20 @@ void beginJob(WiFiClient &client) {
   // task immediately fails to deliver — the user would see the job "complete"
   // while nothing printed.  Leaving drain_error=true short-circuits
   // processPrintStream() on the next loop iteration and surfaces the failure.
-  if (!usb_printer_bridge::is_faulted() && usb_printer_bridge::is_ready()) {
+  if (usb_printer_bridge::is_ready_and_healthy()) {
     bufferClearDrainError();
   } else if (printBuf.drain_error) {
     Serial.println("[JOB] Previous drain error persists — USB not ready yet");
   }
-  printBuf.job_generation++;
-  printBuf.job_active = true;
-  printBuf.recv_active = true;
+  // Pre-fill fields MUST be reset before job_active flips true: the drain task
+  // samples job_active and prefill_done independently, so a stale
+  // prefill_done=true from the previous job can race with a new
+  // job_active=true and skip the pre-fill wait entirely.
   printBuf.prefill_done = false;
   printBuf.prefill_start_ms = millis();
+  printBuf.job_generation++;
+  printBuf.recv_active = true;
+  printBuf.job_active = true;
 
   client.setNoDelay(true);
 
@@ -575,6 +618,21 @@ void pollForClients() {
     activeClient.stop();
     WiFiClient nextClient = printServer.available();
     if (nextClient) {
+      // Refuse the connection up-front when a drain error is latched.  The
+      // README promises "jobs are rejected until the error is cleared"; if we
+      // accept here, the client happily sends data, processPrintStream() sees
+      // drain_error and tears down mid-stream, and the client observes an
+      // unexplained close with silent data loss.  Rejecting before beginJob()
+      // makes the contract match reality: run `clear-error` to print again.
+      if (printBuf.drain_error) {
+        Serial.printf("[CLIENT] Rejected %s:%u: drain_error latched — "
+                      "run `clear-error` on debug console\n",
+                      nextClient.remoteIP().toString().c_str(),
+                      nextClient.remotePort());
+        nextClient.println("BUSY drain_error; run clear-error");
+        nextClient.stop();
+        return;
+      }
       Serial.printf("[CLIENT] Incoming connection from %s:%u while usb_ready=%s "
                     "usb_device=%s\n",
                     nextClient.remoteIP().toString().c_str(),

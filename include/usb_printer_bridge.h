@@ -26,6 +26,10 @@ bool begin();
 bool is_ready();
 bool has_device();
 bool is_faulted();
+// Atomic combined check: true iff the backend is ready AND not faulted under a
+// single state_mutex hold.  Avoids the torn-read gap between is_faulted() and
+// is_ready() at disconnect boundaries.
+bool is_ready_and_healthy();
 bool send_raw(const uint8_t *data, size_t length);
 int recv_raw(uint8_t *data, size_t max_length, uint32_t timeout_ms);
 void get_status(UsbPrinterBridgeStatus *status);
