@@ -4,11 +4,13 @@
 # For brand-new users the path is:
 #
 #     git clone <repo> && cd usb_to_ip_printer
-#     make setup          # creates include/network_config.h from template
-#     $EDITOR include/network_config.h
 #     make build          # compile firmware
 #     make flash          # flash to ESP32-S3 over USB
 #     make monitor        # open serial monitor
+#
+# Wi-Fi credentials are not compiled in.  After flashing, the device brings
+# up its own AP (see setup.txt) and the end user enters their SSID/password
+# via the captive portal.  Every unit ships identical.
 #
 # All targets work both with a local PlatformIO install and inside Docker.
 # The Makefile auto-detects which is available and prefers the local install.
@@ -17,8 +19,6 @@
 
 ENV          ?= esp32-s3-n16r8
 TEST_ENV     ?= native-tests
-NETWORK_CFG  := include/network_config.h
-NETWORK_TMPL := include/network_config.h.template
 
 # Prefer a locally installed pio; fall back to the common PlatformIO Penv path.
 PIO_LOCAL := $(shell command -v pio 2>/dev/null)
@@ -42,7 +42,7 @@ else
   $(error Neither a local `pio` nor `docker` was found. Install PlatformIO (`pip install platformio`) or Docker and retry)
 endif
 
-.PHONY: help setup build flash monitor upload test docker-build docker-test docker-image clean distclean ports doctor
+.PHONY: help build flash monitor upload dev test docker-build docker-test docker-image clean distclean ports doctor require-local-pio
 
 # ---------------------------------------------------------------------------
 # Help (default target)
@@ -51,7 +51,6 @@ help:
 	@echo "ESP32-S3 USB-to-IP print bridge"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make setup         Create include/network_config.h from template"
 	@echo "  make build         Compile firmware"
 	@echo "  make flash         Compile + flash to connected ESP32-S3"
 	@echo "  make monitor       Open serial monitor (115200 baud)"
@@ -71,27 +70,9 @@ help:
 	@echo "Current runner: $(RUNNER_BUILD)"
 
 # ---------------------------------------------------------------------------
-# One-time setup: creates network_config.h from template if missing
-# ---------------------------------------------------------------------------
-setup: $(NETWORK_CFG)
-	@echo ""
-	@echo "======================================================================"
-	@echo "  Edit $(NETWORK_CFG) to set your Wi-Fi SSID/password"
-	@echo "  Then run:  make build  (or  make flash  to build+upload)"
-	@echo "======================================================================"
-
-$(NETWORK_CFG): $(NETWORK_TMPL)
-	@if [ ! -f $(NETWORK_CFG) ]; then \
-	  cp $(NETWORK_TMPL) $(NETWORK_CFG); \
-	  echo "Created $(NETWORK_CFG) from template."; \
-	else \
-	  echo "$(NETWORK_CFG) already exists — not overwriting."; \
-	fi
-
-# ---------------------------------------------------------------------------
 # Build firmware
 # ---------------------------------------------------------------------------
-build: $(NETWORK_CFG)
+build:
 	$(RUNNER_BUILD) run -e $(ENV)
 
 # ---------------------------------------------------------------------------
@@ -99,7 +80,7 @@ build: $(NETWORK_CFG)
 # ---------------------------------------------------------------------------
 # Flashing requires USB passthrough, which Docker doesn't handle cleanly on
 # macOS — so flash/monitor always use the local pio install.
-flash: $(NETWORK_CFG) require-local-pio
+flash: require-local-pio
 	$(PIO_LOCAL) run -e $(ENV) --target upload
 
 upload: flash
@@ -108,7 +89,7 @@ monitor: require-local-pio
 	$(PIO_LOCAL) device monitor
 
 # Combined build + flash + monitor, like a typical edit/flash/debug loop
-dev: $(NETWORK_CFG) require-local-pio
+dev: require-local-pio
 	$(PIO_LOCAL) run -e $(ENV) --target upload && $(PIO_LOCAL) device monitor
 
 # ---------------------------------------------------------------------------
@@ -123,7 +104,7 @@ test:
 docker-image:
 	docker compose build
 
-docker-build: $(NETWORK_CFG)
+docker-build:
 	docker compose run --rm build
 
 docker-test:
@@ -144,7 +125,6 @@ doctor:
 	@echo "Environment check:"
 	@printf "  PlatformIO:     "; $(PIO_LOCAL) --version 2>/dev/null || echo "not installed (install with: pip install platformio)"
 	@printf "  Docker:         "; $(DOCKER) --version 2>/dev/null || echo "not installed"
-	@printf "  network_config: "; [ -f $(NETWORK_CFG) ] && echo "present ($(NETWORK_CFG))" || echo "missing — run: make setup"
 	@printf "  Runner:         "; echo "$(RUNNER_BUILD)"
 	@$(MAKE) --no-print-directory ports
 

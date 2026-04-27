@@ -63,16 +63,20 @@ partition table (`partitions/default_16MB.csv`) provides dual OTA slots.
 
 ## Quick Start
 
-**Zero-to-printing in three commands** (requires `make` and either PlatformIO
+**Zero-to-printing in two commands** (requires `make` and either PlatformIO
 or Docker):
 
 ```bash
 git clone <repo-url> && cd usb_to_ip_printer
-make setup                         # creates include/network_config.h
-$EDITOR include/network_config.h   # set your Wi-Fi SSID/password
 make flash                         # compile + upload to connected ESP32-S3
-make monitor                       # watch it boot and connect
+make monitor                       # watch it boot
 ```
+
+No config files to edit. Every unit flashes identical. After flash, the device
+brings up its own Wi-Fi (`esp32-printer` / `printprint`) with a captive
+portal — the end user enters their home SSID/password from a phone browser,
+and the device stores them in NVS. See `setup.txt` for the end-user guide you
+can ship alongside the hardware.
 
 `make help` shows all available targets. `make doctor` checks your environment
 and lists available USB serial ports.
@@ -81,16 +85,22 @@ and lists available USB serial ports.
 
 ### 1. Wi-Fi configuration
 
-`make setup` creates `include/network_config.h` from the template. The file is
-gitignored so credentials never enter version control. Open it and set:
+None at build time. Credentials are provisioned by the end user at first boot:
 
-| Macro              | Purpose                                                     |
-|--------------------|-------------------------------------------------------------|
-| `WIFI_STA_SSID`    | Your Wi-Fi SSID. Leave empty `""` to skip STA mode.         |
-| `WIFI_STA_PASSWORD`| Wi-Fi password.                                             |
-| `WIFI_AP_SSID`     | Fallback AP name (used when STA connect fails).             |
-| `WIFI_AP_PASSWORD` | Fallback AP password.                                       |
-| `PRINTER_HOSTNAME` | mDNS name; reachable as `<hostname>.local`.                 |
+1. Flash the firmware and power the device. The LED blinks purple.
+2. On a phone, join the Wi-Fi network `esp32-printer` (password `printprint`).
+3. A captive-portal "sign in to network" page pops up (or open
+   `http://192.168.4.1` manually).
+4. Pick the home SSID, enter the password, tap **Save & reboot**.
+5. The device reboots, joins the home network, and LED goes solid green
+   (or orange if no printer is attached yet).
+
+Credentials live in NVS. On later boots the device reconnects automatically.
+If the STA join fails for 2 minutes (router down, moved to a new home,
+password rotated), the device falls back into the captive portal — no serial
+cable required.
+
+To re-provision manually: `nc <device-ip> 2323` → `forget-wifi`.
 
 ### 2. Wire the USB printer
 
@@ -107,7 +117,6 @@ separate from the UART/USB bridge used for serial monitor and flashing.
 
 | Command          | Purpose                                                      |
 |------------------|--------------------------------------------------------------|
-| `make setup`     | Create `include/network_config.h` from template (one time)   |
 | `make build`     | Compile firmware                                             |
 | `make flash`     | Compile + flash to connected ESP32-S3                        |
 | `make monitor`   | Open serial monitor (115200 baud)                            |
@@ -147,7 +156,7 @@ pio test -e native-tests         # tests
 ```
 
 Note the printed IP address from the serial monitor, or connect to the
-fallback AP if station mode was not configured.
+setup AP (`esp32-printer` / `printprint`) if no credentials are stored yet.
 
 ### LED pin
 
@@ -183,14 +192,14 @@ printer and install the driver for your USB printer model.
 1. **Settings > Bluetooth & devices > Printers & scanners > Add device > Add
    manually**.
 2. Select **Add a printer using a TCP/IP address or hostname**.
-3. Enter the ESP32's IP address (or `esp32-print-bridge.local`).
+3. Enter the ESP32's IP address (or `esp32-printer.local`).
 4. Protocol: **Raw**, Port: **9100**.
 5. Install the driver for your printer model (e.g. Canon G1010).
 
 #### macOS
 
 1. **System Settings > Printers & Scanners > +** (IP tab).
-2. Address: ESP32's IP (or `esp32-print-bridge.local`).
+2. Address: ESP32's IP (or `esp32-printer.local`).
 3. Protocol: **HP Jetdirect - Socket**.
 4. Select the appropriate driver or PPD.
 
@@ -235,6 +244,7 @@ Available commands:
 | `buf`         | Ring buffer usage and drain state                                |
 | `heap`        | Free heap, uptime, boot count, reset reason                      |
 | `clear-error` | Clear a stuck USB drain error after reattaching the printer      |
+| `forget-wifi` | Erase saved Wi-Fi credentials and reboot into the setup portal   |
 | `reboot`      | Restart the ESP32 (drops the session)                            |
 | `help`        | List all commands                                                |
 | `close`       | Close the debug session                                          |
@@ -272,11 +282,12 @@ the drain side is keeping up but the sender is filling faster than USB can
 empty. Move the ESP32 closer to the AP, or wire Ethernet via an ESP32-S3
 variant with RMII pins.
 
-**Device unreachable after a reboot.** The STA credentials may be wrong; the
-firmware falls back to AP mode (`ESP32-Print-Bridge` / `printbridge` by
-default). Connect to the AP, then `nc 192.168.4.1 2323` to open the debug
-console, or watch `make monitor` on the serial port — the IP is logged on
-boot.
+**Device unreachable after a reboot.** The saved STA credentials may be
+wrong or the network gone. After ~2 minutes of failed auto-reconnect the
+firmware brings up the setup AP (`esp32-printer` / `printprint`) with the
+captive portal at `http://192.168.4.1`. Re-enter credentials there, or
+connect and run `nc 192.168.4.1 2323` for the debug console. The IP is also
+logged on boot via `make monitor`.
 
 **Can't find the debug console.** It's on TCP 2323, separate from the print
 port 9100. Use `nc <ip> 2323` or `telnet <ip> 2323`.
@@ -320,14 +331,17 @@ port 9100. Use `nc <ip> 2323` or `telnet <ip> 2323`.
 
 ### Network modes
 
-The firmware tries WiFi station mode first. If `WIFI_STA_SSID` is empty, it
-starts its own access point:
+On boot the firmware loads STA credentials from NVS. If they're present it
+tries to join that network; otherwise (or if the join fails for 2 minutes) it
+brings up its own access point and a captive portal for first-time or
+post-move provisioning.
 
-| Setting  | Default value              |
-|----------|----------------------------|
-| SSID     | `ESP32-Print-Bridge`       |
-| Password | `printbridge`              |
-| Hostname | `esp32-print-bridge.local` |
+| Setting        | Value                                     |
+|----------------|-------------------------------------------|
+| Setup AP SSID  | `esp32-printer`                           |
+| Setup AP pass  | `printprint`                              |
+| Setup URL      | `http://192.168.4.1` (or captive pop-up)  |
+| Hostname (STA) | `esp32-printer.local`                     |
 
 ## LED Status Guide
 
@@ -349,11 +363,10 @@ starts its own access point:
 boards/
   esp32-s3-n16r8.json        # Custom board definition (16MB flash, 8MB PSRAM)
 include/
-  network_config.h            # WiFi credentials (gitignored, create manually)
   ring_buffer.h               # Header-only lock-free ring buffer
   usb_printer_bridge.h        # USB host printer bridge API
 src/
-  main.cpp                    # WiFi, TCP servers, LED, state machine, FreeRTOS tasks
+  main.cpp                    # WiFi, captive portal, TCP servers, LED, FreeRTOS tasks
   usb_printer_bridge.cpp      # USB host driver (ESP-IDF USB Host Library)
 test/
   test_ring_buffer/
@@ -364,4 +377,5 @@ Dockerfile                    # Containerized native test runner
 docker-compose.yml            # Docker Compose service for tests
 CanonIJG1000series.ppd.gz     # Canon G1010 PPD for CUPS
 platformio.ini                # Build configuration (esp32-s3-n16r8 + native-tests)
+setup.txt                     # End-user setup guide to ship with the device
 ```

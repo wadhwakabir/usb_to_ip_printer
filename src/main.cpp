@@ -1,6 +1,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <ctype.h>
 extern "C" {
@@ -10,9 +13,16 @@ extern "C" {
 #include "freertos/task.h"
 }
 
-#include "network_config.h"
 #include "ring_buffer.h"
 #include "usb_printer_bridge.h"
+
+// Network identity is baked into the firmware so every unit ships identical
+// and the setup flow is the same everywhere.  Wi-Fi station credentials are
+// entered by the end user via the captive portal and stored in NVS — there is
+// no compile-time STA config.
+#define WIFI_AP_SSID      "esp32-printer"
+#define WIFI_AP_PASSWORD  "printprint"
+#define PRINTER_HOSTNAME  "esp32-printer"
 
 #ifndef RGB_LED_PIN
 #define RGB_LED_PIN 48
@@ -96,6 +106,26 @@ char debugCommandBuffer[kDebugCommandMax] = {0};
 size_t debugCommandLength = 0;
 RTC_DATA_ATTR uint32_t bootCount = 0;
 esp_reset_reason_t lastResetReason = ESP_RST_UNKNOWN;
+
+// --- Wi-Fi provisioning (captive portal) ---------------------------------
+// Wi-Fi STA credentials are stored in NVS and entered at runtime through the
+// captive portal.  The flow:
+//   boot -> load NVS -> try STA -> on failure start AP + captive portal
+//   user connects to AP, fills form -> save to NVS -> reboot -> try STA
+// On moving houses the STA connect fails and the device drops back into
+// AP/captive mode automatically, no reset command needed.
+constexpr uint16_t kDnsPort = 53;
+constexpr uint16_t kHttpPort = 80;
+constexpr const char *kPrefsNamespace = "wifi";
+constexpr const char *kPrefsKeySsid = "ssid";
+constexpr const char *kPrefsKeyPass = "pass";
+
+Preferences wifiPrefs;
+DNSServer dnsServer;
+WebServer httpServer(kHttpPort);
+bool captivePortalActive = false;
+char provisionedSsid[64] = {0};
+char provisionedPass[64] = {0};
 
 const char *resetReasonName(esp_reset_reason_t reason) {
   switch (reason) {
@@ -222,6 +252,13 @@ void logNetworkSummary() {
 }
 
 DeviceState idleStateForCurrentHardware() {
+  // While the captive portal is up, the device is not usable for printing
+  // regardless of USB state — show AccessPointReady so a non-technical user
+  // doesn't mistake a solid green LED for "configured" when we're still
+  // waiting on Wi-Fi credentials.
+  if (captivePortalActive) {
+    return DeviceState::AccessPointReady;
+  }
   if (usb_printer_bridge::is_ready()) {
     return DeviceState::Ready;
   }
@@ -241,15 +278,38 @@ bool startMdns() {
   return true;
 }
 
+void loadProvisionedCredentials() {
+  wifiPrefs.begin(kPrefsNamespace, /*readOnly=*/true);
+  const String s = wifiPrefs.getString(kPrefsKeySsid, "");
+  const String p = wifiPrefs.getString(kPrefsKeyPass, "");
+  wifiPrefs.end();
+  strlcpy(provisionedSsid, s.c_str(), sizeof(provisionedSsid));
+  strlcpy(provisionedPass, p.c_str(), sizeof(provisionedPass));
+}
+
+bool saveProvisionedCredentials(const char *ssid, const char *pass) {
+  if (ssid == nullptr || ssid[0] == '\0') {
+    return false;
+  }
+  wifiPrefs.begin(kPrefsNamespace, /*readOnly=*/false);
+  wifiPrefs.putString(kPrefsKeySsid, ssid);
+  wifiPrefs.putString(kPrefsKeyPass, pass ? pass : "");
+  wifiPrefs.end();
+  return true;
+}
+
 bool connectToWifiStation() {
-  if (strlen(WIFI_STA_SSID) == 0) {
+  // Credentials always come from NVS (provisioned via the captive portal).
+  // No compile-time STA config: every unit is identical until the end user
+  // configures it.
+  if (provisionedSsid[0] == '\0') {
     return false;
   }
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASSWORD);
+  WiFi.begin(provisionedSsid, provisionedPass);
   setState(DeviceState::WifiConnecting);
-  Serial.printf("[WIFI] Connecting to SSID \"%s\"\n", WIFI_STA_SSID);
+  Serial.printf("[WIFI] Connecting to SSID \"%s\"\n", provisionedSsid);
 
   const uint32_t startedAt = millis();
   while (WiFi.status() != WL_CONNECTED &&
@@ -265,6 +325,7 @@ bool connectToWifiStation() {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WIFI] Connect timed out");
+    WiFi.disconnect(true, /*eraseap=*/false);
     return false;
   }
 
@@ -285,6 +346,165 @@ bool startAccessPoint() {
   startedAsAccessPoint = true;
   Serial.printf("[WIFI] Started fallback access point \"%s\"\n", WIFI_AP_SSID);
   return true;
+}
+
+// --- Captive portal ------------------------------------------------------
+
+// Minimal HTML escaper for user-supplied SSID echoed back into the form.
+String htmlEscape(const String &in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); ++i) {
+    const char c = in[i];
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
+String renderPortalPage(const String &message) {
+  String scanList;
+  const int n = WiFi.scanComplete();
+  if (n > 0) {
+    scanList += F("<datalist id=\"nets\">");
+    for (int i = 0; i < n; ++i) {
+      scanList += F("<option value=\"");
+      scanList += htmlEscape(WiFi.SSID(i));
+      scanList += F("\">");
+    }
+    scanList += F("</datalist>");
+  }
+
+  String page;
+  page.reserve(1800);
+  page += F(
+      "<!doctype html><html><head><meta charset=\"utf-8\">"
+      "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+      "<title>Printer setup</title>"
+      "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+      "max-width:420px;margin:2em auto;padding:0 1em;color:#222}"
+      "h1{font-size:1.3em}label{display:block;margin:1em 0 .3em}"
+      "input{width:100%;padding:.6em;font-size:1em;box-sizing:border-box;"
+      "border:1px solid #bbb;border-radius:6px}"
+      "button{margin-top:1.5em;width:100%;padding:.8em;font-size:1em;"
+      "background:#0a7;color:#fff;border:0;border-radius:6px}"
+      ".msg{padding:.7em;border-radius:6px;background:#eef;margin:1em 0}"
+      ".hint{color:#666;font-size:.9em;margin-top:.3em}</style></head><body>"
+      "<h1>Printer Wi-Fi setup</h1>");
+  if (message.length() > 0) {
+    page += F("<div class=\"msg\">");
+    page += message;
+    page += F("</div>");
+  }
+  // Pre-fill the SSID with what's currently saved so a password-only rotation
+  // (common when a router's guest/main password changes) doesn't force the
+  // user to retype their network name.  Password is never echoed back.
+  String ssidValue;
+  if (provisionedSsid[0] != '\0') {
+    ssidValue = htmlEscape(String(provisionedSsid));
+  }
+
+  page += F(
+      "<form method=\"POST\" action=\"/save\">"
+      "<label>Wi-Fi network name (SSID)"
+      "<input name=\"ssid\" list=\"nets\" required autofocus value=\"");
+  page += ssidValue;
+  page += F(
+      "\"></label>"
+      "<label>Password"
+      "<input name=\"pass\" type=\"password\"></label>"
+      "<div class=\"hint\">The printer will reboot and try to join this "
+      "network. If it can't, it will re-open this setup page.</div>"
+      "<button type=\"submit\">Save &amp; reboot</button></form>");
+  page += scanList;
+  page += F("</body></html>");
+  return page;
+}
+
+void handlePortalRoot() {
+  // Scan asynchronously so the form gets a fresh list next load without
+  // blocking this response.
+  if (WiFi.scanComplete() == WIFI_SCAN_FAILED) {
+    WiFi.scanNetworks(/*async=*/true);
+  }
+  httpServer.send(200, "text/html", renderPortalPage(""));
+}
+
+void handlePortalSave() {
+  const String ssid = httpServer.arg("ssid");
+  const String pass = httpServer.arg("pass");
+  if (ssid.length() == 0 || ssid.length() >= sizeof(provisionedSsid) ||
+      pass.length() >= sizeof(provisionedPass)) {
+    httpServer.send(400, "text/html",
+                    renderPortalPage(F("SSID is required and must be "
+                                       "under 64 chars.")));
+    return;
+  }
+  if (!saveProvisionedCredentials(ssid.c_str(), pass.c_str())) {
+    httpServer.send(500, "text/html",
+                    renderPortalPage(F("Could not save credentials.")));
+    return;
+  }
+  Serial.printf("[PORTAL] Saved credentials for SSID \"%s\", rebooting\n",
+                ssid.c_str());
+  httpServer.send(200, "text/html",
+                  F("<!doctype html><meta charset=\"utf-8\"><body style=\""
+                    "font-family:sans-serif;max-width:420px;margin:2em auto\">"
+                    "<h1>Saved</h1><p>Rebooting and attempting to join the "
+                    "network. If the printer can't connect, it will re-open "
+                    "this setup Wi-Fi.</p></body>"));
+  delay(400);
+  ESP.restart();
+}
+
+// Most phones probe a few well-known URLs to detect captive portals.  Serving
+// a 302 to the root makes the OS pop up the "Sign in to network" sheet
+// automatically, so the non-technical user doesn't have to type an IP.
+void handleCaptiveProbe() {
+  httpServer.sendHeader("Location", "http://192.168.4.1/", /*first=*/true);
+  httpServer.send(302, "text/plain", "");
+}
+
+void startCaptivePortal() {
+  if (captivePortalActive) {
+    return;
+  }
+  const IPAddress apIp = WiFi.softAPIP();
+  // DNS hijack: every lookup resolves to us, so any URL the OS probes lands
+  // on our server and triggers the captive portal UX.
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(kDnsPort, "*", apIp);
+
+  httpServer.on("/", HTTP_GET, handlePortalRoot);
+  httpServer.on("/save", HTTP_POST, handlePortalSave);
+  // Catch-alls for common OS captive-portal probes.
+  httpServer.on("/generate_204", HTTP_GET, handleCaptiveProbe);        // Android
+  httpServer.on("/gen_204", HTTP_GET, handleCaptiveProbe);             // Android
+  httpServer.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe); // iOS/macOS
+  httpServer.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
+  httpServer.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);            // Windows
+  httpServer.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);     // Windows
+  httpServer.onNotFound(handleCaptiveProbe);
+  httpServer.begin();
+
+  WiFi.scanNetworks(/*async=*/true);  // warm up the SSID list
+  captivePortalActive = true;
+  Serial.printf("[PORTAL] Captive portal active at http://%s/\n",
+                apIp.toString().c_str());
+}
+
+void pollCaptivePortal() {
+  if (!captivePortalActive) {
+    return;
+  }
+  dnsServer.processNextRequest();
+  httpServer.handleClient();
 }
 
 void startPrintServer() {
@@ -618,6 +838,19 @@ void pollForClients() {
     activeClient.stop();
     WiFiClient nextClient = printServer.available();
     if (nextClient) {
+      // Refuse up-front when the device is in setup mode (captive portal
+      // active = still provisioning Wi-Fi).  Anything that connects to :9100
+      // on the setup AP is almost certainly a leftover printer queue from
+      // the user's previous home, not a real job we can deliver.
+      if (captivePortalActive) {
+        Serial.printf("[CLIENT] Rejected %s:%u: device is in Wi-Fi setup "
+                      "mode\n",
+                      nextClient.remoteIP().toString().c_str(),
+                      nextClient.remotePort());
+        nextClient.println("BUSY wifi setup pending");
+        nextClient.stop();
+        return;
+      }
       // Refuse the connection up-front when a drain error is latched.  The
       // README promises "jobs are rejected until the error is cleared"; if we
       // accept here, the client happily sends data, processPrintStream() sees
@@ -870,6 +1103,7 @@ void writeDebugHelp(WiFiClient &client) {
   client.println(F("  buf         - print buffer status"));
   client.println(F("  heap        - heap and reset info"));
   client.println(F("  clear-error - clear a stuck drain error after reattaching printer"));
+  client.println(F("  forget-wifi - erase saved Wi-Fi credentials and reboot into setup AP"));
   client.println(F("  reboot      - restart the ESP32 (drops this session)"));
   client.println(F("  close       - close this debug session"));
 }
@@ -996,6 +1230,21 @@ void handleDebugCommand(WiFiClient &client, const char *rawCommand) {
     client.println(F("drain_error cleared."));
     return;
   }
+  if (strcmp(start, "forget-wifi") == 0) {
+    // Wipe NVS-stored credentials and reboot.  Next boot will find no saved
+    // SSID and come up as the captive-portal AP so the user can re-provision.
+    // Allowed while a job is active — this is a manual recovery command and
+    // the user knows they're blowing away the session.
+    wifiPrefs.begin(kPrefsNamespace, /*readOnly=*/false);
+    wifiPrefs.clear();
+    wifiPrefs.end();
+    Serial.println("[DEBUG] Wi-Fi credentials erased; rebooting into setup AP");
+    client.println(F("Wi-Fi credentials erased. Rebooting into setup AP..."));
+    client.stop();
+    delay(200);
+    ESP.restart();
+    return;
+  }
   if (strcmp(start, "reboot") == 0 || strcmp(start, "restart") == 0) {
     client.println(F("Rebooting..."));
     client.stop();
@@ -1071,6 +1320,13 @@ void pollDebugServer() {
   }
 }
 
+// How long STA can stay disconnected before we give up on auto-reconnect and
+// bring the captive portal back.  Short enough that a non-technical user
+// isn't stuck with a dead device, long enough that routine router blips
+// (power outage, channel change) don't thrash the network state.
+constexpr uint32_t kStaReconnectGiveUpMs = 120000;  // 2 minutes
+uint32_t staDisconnectedSinceMs = 0;
+
 void checkWifiConnection() {
   if (startedAsAccessPoint) {
     return;
@@ -1082,6 +1338,7 @@ void checkWifiConnection() {
                     WiFi.localIP().toString().c_str());
       setState(idleStateForCurrentHardware());
     }
+    staDisconnectedSinceMs = 0;
     return;
   }
   // Wi-Fi dropped — show it in state unless a job is active (auto-reconnect
@@ -1091,6 +1348,28 @@ void checkWifiConnection() {
       currentState != DeviceState::Error) {
     Serial.println("[WIFI] Connection lost, waiting for auto-reconnect");
     setState(DeviceState::WifiConnecting);
+  }
+
+  // Track the first moment we noticed the drop.  If auto-reconnect hasn't
+  // recovered in kStaReconnectGiveUpMs, the router is gone for real (wrong
+  // password after rotation, dead router, AP out of range) — drop STA and
+  // come up as the captive portal so the recipient can re-provision without
+  // a power cycle or serial cable.  A live job gets a grace period.
+  if (staDisconnectedSinceMs == 0) {
+    staDisconnectedSinceMs = millis();
+  }
+  if (!jobStats.active &&
+      millis() - staDisconnectedSinceMs > kStaReconnectGiveUpMs) {
+    Serial.println("[WIFI] Auto-reconnect gave up; switching to setup AP");
+    WiFi.disconnect(/*wifioff=*/true, /*eraseap=*/false);
+    delay(100);
+    if (startAccessPoint()) {
+      startCaptivePortal();
+      setState(DeviceState::AccessPointReady);
+    } else {
+      Serial.println("[WIFI] Failed to bring up fallback AP");
+    }
+    staDisconnectedSinceMs = 0;
   }
 }
 
@@ -1140,11 +1419,25 @@ void setup() {
 
   Serial.printf("[BOOT] RGB LED on GPIO %d\n", RGB_LED_PIN);
 
+  loadProvisionedCredentials();
+  if (provisionedSsid[0] != '\0') {
+    Serial.printf("[BOOT] Found saved Wi-Fi credentials for \"%s\"\n",
+                  provisionedSsid);
+  } else {
+    Serial.println("[BOOT] No saved Wi-Fi credentials; will use compile-time "
+                   "defaults if set");
+  }
+
   const bool connected = connectToWifiStation();
   if (!connected && !startAccessPoint()) {
     Serial.println("[ERROR] Failed to bring up any network mode");
     setState(DeviceState::Error);
     return;
+  }
+  if (!connected) {
+    // AP fallback is running — spin up the captive portal so the recipient
+    // can enter home Wi-Fi credentials from a phone without touching serial.
+    startCaptivePortal();
   }
 
   if (!startMdns()) {
@@ -1215,6 +1508,9 @@ void loop() {
   // Debug console stays responsive even during an active print — it's the
   // only visibility users have once a job is underway.
   pollDebugServer();
+  // Captive portal is only active while in AP fallback mode — services DNS
+  // hijack and the HTTP form until the user saves credentials and reboots.
+  pollCaptivePortal();
   restoreReadyStateIfNeeded();
   syncIdleStateWithPrinter();
   checkWifiConnection();
