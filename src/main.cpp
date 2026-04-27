@@ -337,6 +337,12 @@ bool connectToWifiStation() {
 
 bool startAccessPoint() {
   WiFi.mode(WIFI_AP);
+  // Explicit AP network config.  Setting the gateway to ourselves ensures
+  // phones route all traffic (including manual browser requests to 192.168.4.1)
+  // over this WiFi interface rather than falling back to cellular.
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1),   // local IP
+                    IPAddress(192, 168, 4, 1),   // gateway = us
+                    IPAddress(255, 255, 255, 0)); // subnet
   const bool started = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
   if (!started) {
     Serial.println("[WIFI] SoftAP start failed");
@@ -417,8 +423,15 @@ String renderPortalPage(const String &message) {
   page += ssidValue;
   page += F(
       "\"></label>"
-      "<label>Password"
-      "<input name=\"pass\" type=\"password\"></label>"
+      "<label>Password</label>"
+      "<div style=\"position:relative\">"
+      "<input id=\"pw\" name=\"pass\" type=\"password\" style=\"padding-right:2.5em\">"
+      "<button type=\"button\" onclick=\"var p=document.getElementById('pw');"
+      "p.type=p.type==='password'?'text':'password';"
+      "this.textContent=p.type==='password'?'\xF0\x9F\x91\x81':'\\u2715'\" "
+      "style=\"position:absolute;right:.5em;top:50%;transform:translateY(-50%);"
+      "background:none;border:none;font-size:1.2em;cursor:pointer;padding:0\">"
+      "\xF0\x9F\x91\x81</button></div>"
       "<div class=\"hint\">The printer will reboot and try to join this "
       "network. If it can't, it will re-open this setup page.</div>"
       "<button type=\"submit\">Save &amp; reboot</button></form>");
@@ -433,6 +446,7 @@ void handlePortalRoot() {
   if (WiFi.scanComplete() == WIFI_SCAN_FAILED) {
     WiFi.scanNetworks(/*async=*/true);
   }
+  httpServer.sendHeader("Connection", "close");
   httpServer.send(200, "text/html", renderPortalPage(""));
 }
 
@@ -467,8 +481,16 @@ void handlePortalSave() {
 // a 302 to the root makes the OS pop up the "Sign in to network" sheet
 // automatically, so the non-technical user doesn't have to type an IP.
 void handleCaptiveProbe() {
-  httpServer.sendHeader("Location", "http://192.168.4.1/", /*first=*/true);
+  httpServer.sendHeader("Location", "http://192.168.4.1/");
+  httpServer.sendHeader("Connection", "close");
   httpServer.send(302, "text/plain", "");
+}
+
+void handleAndroidGenerate204() {
+  httpServer.sendHeader("Connection", "close");
+  httpServer.send(200, "text/html",
+                  F("<html><head><meta http-equiv=\"refresh\" "
+                    "content=\"0;url=http://192.168.4.1/\"></head></html>"));
 }
 
 void startCaptivePortal() {
@@ -483,14 +505,18 @@ void startCaptivePortal() {
 
   httpServer.on("/", HTTP_GET, handlePortalRoot);
   httpServer.on("/save", HTTP_POST, handlePortalSave);
-  // Catch-alls for common OS captive-portal probes.
-  httpServer.on("/generate_204", HTTP_GET, handleCaptiveProbe);        // Android
-  httpServer.on("/gen_204", HTTP_GET, handleCaptiveProbe);             // Android
-  httpServer.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe); // iOS/macOS
+  // Android connectivity probes — return 200 with redirect body instead of
+  // 302 so newer Android versions (which use HTTPS probes and fall back to
+  // HTTP) properly trigger the captive portal sheet.
+  httpServer.on("/generate_204", HTTP_GET, handleAndroidGenerate204);
+  httpServer.on("/gen_204", HTTP_GET, handleAndroidGenerate204);
+  // iOS/macOS and Windows probes — 302 redirect triggers the sign-in sheet.
+  httpServer.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
   httpServer.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
-  httpServer.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);            // Windows
-  httpServer.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);     // Windows
+  httpServer.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);
+  httpServer.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);
   httpServer.onNotFound(handleCaptiveProbe);
+  httpServer.enableDelay(false);
   httpServer.begin();
 
   WiFi.scanNetworks(/*async=*/true);  // warm up the SSID list
