@@ -42,7 +42,7 @@ constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint32_t kClientProbeTimeoutMs = 5000;
 constexpr uint32_t kPrintIdleTimeoutMs = 30000;
 constexpr uint32_t kChunkBufferSize = 4096;
-constexpr size_t kDrainChunkSize = 1024;
+constexpr size_t kDrainChunkSize = 4096;
 constexpr size_t kDebugCommandMax = 96;
 constexpr size_t kDebugBytesPerPoll = 64;
 constexpr size_t kPrintBufferCapacity = 512 * 1024;  // 512KB read-ahead buffer (PSRAM)
@@ -1464,7 +1464,7 @@ void setup() {
                 printBuf.ring.storage >= (uint8_t *)0x3C000000 ? "PSRAM"
                                                                : "heap",
                 ESP.getFreeHeap());
-  xTaskCreatePinnedToCore(printBufferDrainTask, "buf_drain", 4096, nullptr, 10,
+  xTaskCreatePinnedToCore(printBufferDrainTask, "buf_drain", 6144, nullptr, 10,
                           &printBuf.drain_task, 0);
   if (printBuf.drain_task == nullptr) {
     Serial.println("[ERROR] Buffer drain task creation failed");

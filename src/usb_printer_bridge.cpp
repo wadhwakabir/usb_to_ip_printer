@@ -18,7 +18,7 @@ namespace {
 
 constexpr uint8_t kPrinterClassCode = USB_CLASS_PRINTER;
 constexpr bool kAllowDryRunWithoutPrinter = false;
-constexpr size_t kTransferBufferSize = 1024;
+constexpr size_t kTransferBufferSize = 4096;
 constexpr size_t kInTransferBufferSize = 1024;
 constexpr TickType_t kTransferTimeoutTicks = pdMS_TO_TICKS(15000);
 
