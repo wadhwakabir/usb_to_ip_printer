@@ -24,8 +24,8 @@ bytes in both directions -- no printer-specific firmware needed.
   to smooth WiFi jitter before USB output begins
 - **Dedicated FreeRTOS tasks** -- drain task (core 0) for USB OUT transfers,
   receive task (core 1) for USB IN polling
-- **TCP debug console** on port 2323 (telnet) -- commands: `status`, `usb`,
-  `job`, `buf`, `heap`, `help`, `close`
+- **TCP debug console** on port 2323 (telnet) -- inspect live status, recover
+  from USB faults, and reboot remotely without physical access
 - **NeoPixel RGB LED** status indication with a state machine
 - **Robust error handling** -- endpoint recovery (halt/flush/clear), transfer
   timeouts, auto-reconnect on WiFi loss
@@ -161,9 +161,10 @@ build_flags =
 
 ## Testing
 
-The ring buffer has a comprehensive test suite (70+ tests covering wrap
-boundaries, backpressure, data integrity, sentinel invariants, and more) that
-runs natively on the host -- no ESP32 hardware required.
+The ring buffer has a comprehensive test suite (100+ tests covering wrap
+boundaries, backpressure, data integrity, sentinel invariants, a randomized
+stress test against a `std::deque` reference model, and more) that runs
+natively on the host -- no ESP32 hardware required.
 
 ```bash
 make test                  # local or docker, whichever is available
@@ -225,15 +226,60 @@ nc <esp32-ip> 2323
 
 Available commands:
 
-| Command  | Description                                |
-|----------|--------------------------------------------|
-| `status` | Full bridge status (network, USB, job, buffer, heap) |
-| `usb`    | USB counters, endpoints, last error        |
-| `job`    | Current job byte/chunk counters            |
-| `buf`    | Ring buffer usage and drain state          |
-| `heap`   | Free heap, uptime, boot count, reset reason |
-| `help`   | List all commands                          |
-| `close`  | Close the debug session                    |
+| Command       | Description                                                      |
+|---------------|------------------------------------------------------------------|
+| `status`      | Full bridge status (network, USB, job, buffer, heap) in one dump |
+| `net`         | Mode/SSID/IP/RSSI summary                                        |
+| `usb`         | USB counters, endpoints, last error                              |
+| `job`         | Current job byte/chunk counters                                  |
+| `buf`         | Ring buffer usage and drain state                                |
+| `heap`        | Free heap, uptime, boot count, reset reason                      |
+| `clear-error` | Clear a stuck USB drain error after reattaching the printer      |
+| `reboot`      | Restart the ESP32 (drops the session)                            |
+| `help`        | List all commands                                                |
+| `close`       | Close the debug session                                          |
+
+**Recovering from a USB fault.** If the printer loses USB mid-job, subsequent
+jobs are rejected until the error is cleared — this is intentional so silent
+drops don't happen. After power-cycling or re-seating the printer cable:
+
+```
+$ nc <esp32-ip> 2323
+esp32-print> usb          # confirm device=yes ready=yes
+esp32-print> clear-error
+drain_error cleared.
+esp32-print> close
+```
+
+If the device is truly wedged (e.g. USB host task hung), `reboot` restarts the
+firmware without needing physical access.
+
+## Troubleshooting
+
+**Job appears to complete but nothing prints.** Check `usb` on the debug
+console. If `faulted=yes` or `ready=no`, the USB backend gave up mid-job. Power
+cycle the printer, then run `clear-error` and reprint. The firmware intentionally
+rejects new jobs after a drain error to avoid silently discarding data.
+
+**"No USB printer attached" / stuck on orange LED.** The device sees no USB
+printer. Verify the printer is powered, the cable goes to the ESP32's **host**
+USB port (not the UART/programming port), and the printer shows up in `usb` as
+`device=yes`. Some printers need 30-60 s after power-on to enumerate.
+
+**Prints start then stall mid-page.** Usually WiFi jitter combined with a large
+job exceeding the 512 KB buffer. Check `buf` — if `used=524287` persistently,
+the drain side is keeping up but the sender is filling faster than USB can
+empty. Move the ESP32 closer to the AP, or wire Ethernet via an ESP32-S3
+variant with RMII pins.
+
+**Device unreachable after a reboot.** The STA credentials may be wrong; the
+firmware falls back to AP mode (`ESP32-Print-Bridge` / `printbridge` by
+default). Connect to the AP, then `nc 192.168.4.1 2323` to open the debug
+console, or watch `make monitor` on the serial port — the IP is logged on
+boot.
+
+**Can't find the debug console.** It's on TCP 2323, separate from the print
+port 9100. Use `nc <ip> 2323` or `telnet <ip> 2323`.
 
 ## Architecture
 
@@ -311,7 +357,7 @@ src/
   usb_printer_bridge.cpp      # USB host driver (ESP-IDF USB Host Library)
 test/
   test_ring_buffer/
-    test_main.cpp             # Native unit tests for ring buffer (35+ tests)
+    test_main.cpp             # Native unit tests for ring buffer (100+ tests)
 partitions/
   default_16MB.csv            # Partition table with dual OTA slots
 Dockerfile                    # Containerized native test runner

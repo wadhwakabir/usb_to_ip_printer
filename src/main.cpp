@@ -321,9 +321,14 @@ size_t bufferRead(uint8_t *data, size_t maxLen) {
 void bufferReset() {
   xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
   printBuf.ring.reset();
-  printBuf.drain_error = false;
   xSemaphoreGive(printBuf.mutex);
   xSemaphoreTake(printBuf.data_ready, 0);
+}
+
+void bufferClearDrainError() {
+  xSemaphoreTake(printBuf.mutex, portMAX_DELAY);
+  printBuf.drain_error = false;
+  xSemaphoreGive(printBuf.mutex);
 }
 
 size_t bufferUsed() {
@@ -489,6 +494,17 @@ void flushPrintBuffer() {
 
 void beginJob(WiFiClient &client) {
   bufferReset();
+  // Only clear the drain_error flag if USB looks usable again.  If a previous
+  // job ended because USB died and the printer hasn't recovered, starting a
+  // fresh job with drain_error=false would accept TCP bytes that the drain
+  // task immediately fails to deliver — the user would see the job "complete"
+  // while nothing printed.  Leaving drain_error=true short-circuits
+  // processPrintStream() on the next loop iteration and surfaces the failure.
+  if (!usb_printer_bridge::is_faulted() && usb_printer_bridge::is_ready()) {
+    bufferClearDrainError();
+  } else if (printBuf.drain_error) {
+    Serial.println("[JOB] Previous drain error persists — USB not ready yet");
+  }
   printBuf.job_generation++;
   printBuf.job_active = true;
   printBuf.recv_active = true;
@@ -788,13 +804,16 @@ void writeDebugStatus(WiFiClient &client) {
 
 void writeDebugHelp(WiFiClient &client) {
   client.println(F("Commands:"));
-  client.println(F("  help   - show this help"));
-  client.println(F("  status - full bridge status"));
-  client.println(F("  usb    - USB counters and last error"));
-  client.println(F("  job    - current job counters"));
-  client.println(F("  buf    - print buffer status"));
-  client.println(F("  heap   - heap and reset info"));
-  client.println(F("  close  - close this debug session"));
+  client.println(F("  help        - show this help"));
+  client.println(F("  status      - full bridge status"));
+  client.println(F("  net         - network/IP summary"));
+  client.println(F("  usb         - USB counters and last error"));
+  client.println(F("  job         - current job counters"));
+  client.println(F("  buf         - print buffer status"));
+  client.println(F("  heap        - heap and reset info"));
+  client.println(F("  clear-error - clear a stuck drain error after reattaching printer"));
+  client.println(F("  reboot      - restart the ESP32 (drops this session)"));
+  client.println(F("  close       - close this debug session"));
 }
 
 void writeUsbSummary(WiFiClient &client) {
@@ -820,6 +839,22 @@ void writeJobSummary(WiFiClient &client) {
                 static_cast<unsigned>(jobStats.bytesReceived),
                 static_cast<unsigned>(jobStats.chunksReceived),
                 stateName(currentState));
+}
+
+void writeNetSummary(WiFiClient &client) {
+  const String ip = startedAsAccessPoint ? WiFi.softAPIP().toString()
+                                         : WiFi.localIP().toString();
+  const String ssid =
+      startedAsAccessPoint ? String(WIFI_AP_SSID) : WiFi.SSID();
+  client.printf("mode=%s ssid=%s ip=%s hostname=%s.local raw_port=%u "
+                "debug_port=%u\n",
+                startedAsAccessPoint ? "AP" : "STA", ssid.c_str(), ip.c_str(),
+                PRINTER_HOSTNAME, kRawPrintPort, kDebugPort);
+  if (!startedAsAccessPoint) {
+    client.printf("rssi=%d wifi_status=%d\n", WiFi.RSSI(), WiFi.status());
+  } else {
+    client.printf("ap_clients=%u\n", WiFi.softAPgetStationNum());
+  }
 }
 
 void writeHeapSummary(WiFiClient &client) {
@@ -879,6 +914,36 @@ void handleDebugCommand(WiFiClient &client, const char *rawCommand) {
   }
   if (strcmp(start, "heap") == 0) {
     writeHeapSummary(client);
+    return;
+  }
+  if (strcmp(start, "net") == 0) {
+    writeNetSummary(client);
+    return;
+  }
+  if (strcmp(start, "clear-error") == 0) {
+    // Manual recovery path: after the user unplugs and re-plugs a printer
+    // (or the USB backend recovers from a halt), clear the drain_error flag
+    // so the next print job is accepted.  Refuses if a job is currently
+    // active — clearing mid-print would confuse backpressure signaling.
+    if (printBuf.job_active || jobStats.active) {
+      client.println(F("Cannot clear error while a job is active."));
+      return;
+    }
+    if (!printBuf.drain_error) {
+      client.println(F("No drain error to clear."));
+      return;
+    }
+    bufferClearDrainError();
+    Serial.println("[DEBUG] drain_error cleared via debug console");
+    client.println(F("drain_error cleared."));
+    return;
+  }
+  if (strcmp(start, "reboot") == 0 || strcmp(start, "restart") == 0) {
+    client.println(F("Rebooting..."));
+    client.stop();
+    Serial.println("[DEBUG] Reboot requested via debug console");
+    delay(100);  // give Serial/TCP time to flush before reset
+    ESP.restart();
     return;
   }
   if (strcmp(start, "close") == 0 || strcmp(start, "exit") == 0 ||
@@ -1072,17 +1137,26 @@ void setup() {
 void loop() {
   updateLed();
 
-  // processPrintStream() MUST run before pollForClients().
-  // pollForClients() probes the socket via connected(), which can set the
-  // WiFiClient's internal _connected flag to false on peer shutdown.  Once
-  // that flag is false, available() and read() short-circuit to 0/−1 and
-  // any unread TCP data is silently lost.  By reading first we capture the
-  // full payload while _connected is still true.
-  processPrintStream();
-  pollForClients();
-  if (currentState != DeviceState::Printing) {
-    pollDebugServer();
+  // If setup() bailed out early (WiFi/USB/buffer init failed) the print-data
+  // path is not safe to run: the ring-buffer mutex may be null, causing
+  // xSemaphoreTake(NULL, ...) to assert.  Skip print polling but keep the
+  // debug console + LED alive so users can still inspect the failure over
+  // the serial monitor or LAN.
+  const bool printPathReady = (printBuf.mutex != nullptr);
+
+  if (printPathReady) {
+    // processPrintStream() MUST run before pollForClients().
+    // pollForClients() probes the socket via connected(), which can set the
+    // WiFiClient's internal _connected flag to false on peer shutdown.  Once
+    // that flag is false, available() and read() short-circuit to 0/−1 and
+    // any unread TCP data is silently lost.  By reading first we capture the
+    // full payload while _connected is still true.
+    processPrintStream();
+    pollForClients();
   }
+  // Debug console stays responsive even during an active print — it's the
+  // only visibility users have once a job is underway.
+  pollDebugServer();
   restoreReadyStateIfNeeded();
   syncIdleStateWithPrinter();
   checkWifiConnection();
