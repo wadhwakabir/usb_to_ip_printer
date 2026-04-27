@@ -27,6 +27,7 @@ bool is_ready();
 bool has_device();
 bool is_faulted();
 bool send_raw(const uint8_t *data, size_t length);
+int recv_raw(uint8_t *data, size_t max_length, uint32_t timeout_ms);
 void get_status(UsbPrinterBridgeStatus *status);
 const char *last_error();
 

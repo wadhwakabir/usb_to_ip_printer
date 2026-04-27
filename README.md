@@ -1,272 +1,321 @@
-# USB to IP Print Bridge (ESP32-S3)
+# USB-to-IP Printer Bridge (ESP32-S3)
 
-Turn any USB printer into a network printer. An ESP32-S3 accepts RAW TCP print
-jobs over Wi-Fi on port `9100` and forwards them to a USB printer connected to
-its host port. Your computer's printer driver renders the job; the ESP32 simply
-shuttles the bytes over USB — no printer-specific firmware needed.
+Turn any USB printer into a network printer. An ESP32-S3 accepts print jobs
+over Wi-Fi on TCP port 9100 (RAW/AppSocket protocol) and forwards the data to
+a USB printer via the host port. Printer responses (PJL status, etc.) are read
+from the USB bulk IN endpoint and relayed back to the TCP client, providing
+full **bidirectional communication**.
 
-> **Canon G1010 is used as an example throughout this README.** The bridge works
-> with any USB printer that exposes a Bulk OUT endpoint (which covers virtually
-> all USB printers).
+Your computer's printer driver renders the job; the ESP32 simply shuttles
+bytes in both directions -- no printer-specific firmware needed.
 
-## How It Works
+> **Canon G1010 is used as the reference printer throughout.** The bridge works
+> with any USB printer that exposes bulk endpoints (virtually all of them).
 
-```
-┌──────────────┐          Wi-Fi / LAN          ┌──────────────┐         USB          ┌─────────────┐
-│              │  RAW TCP port 9100             │              │  Bulk OUT endpoint   │             │
-│   Computer   │ ──────────────────────────────>│   ESP32-S3   │ ───────────────────> │ USB Printer │
-│  (driver     │  print data stream             │  Print Bridge│  raw data forwarded  │ (any model) │
-│   renders)   │                                │              │                      │             │
-└──────────────┘                                └──────────────┘                      └─────────────┘
-       │                                               │
-       │  1. OS printer driver renders                 │  3. Drain task sends buffered
-       │     the document into RAW bytes               │     data to USB Bulk OUT endpoint
-       │  2. Sends over TCP to ESP32 on port 9100      │  4. Printer receives and prints
-       │                                               │
-       ▼                                               ▼
-  Printer added as                              512KB PSRAM ring buffer
-  "RAW TCP/IP printer"                          decouples Wi-Fi jitter
-  pointing at ESP32 IP                          from USB transfer rate
-```
+## Features
 
-### Data Flow (Step by Step)
+- **Bidirectional USB** -- print data flows to the printer via bulk OUT;
+  printer responses return via bulk IN and are forwarded to the TCP client
+- **WiFi STA with AP fallback** -- connects to an existing network or creates
+  its own access point when no credentials are configured
+- **mDNS advertisement** -- `_printer._tcp` and `_pdl-datastream._tcp` service
+  records, reachable as `<hostname>.local`
+- **512 KB PSRAM ring buffer** -- read-ahead buffer with a 64 KB pre-fill gate
+  to smooth WiFi jitter before USB output begins
+- **Dedicated FreeRTOS tasks** -- drain task (core 0) for USB OUT transfers,
+  receive task (core 1) for USB IN polling
+- **TCP debug console** on port 2323 (telnet) -- commands: `status`, `usb`,
+  `job`, `buf`, `heap`, `help`, `close`
+- **NeoPixel RGB LED** status indication with a state machine
+- **Robust error handling** -- endpoint recovery (halt/flush/clear), transfer
+  timeouts, auto-reconnect on WiFi loss
+- **Native unit tests** for the ring buffer (runs on host, no hardware needed)
+- **Docker-based test runner** for CI or isolated builds
 
-1. **Computer** — The printer driver (e.g. Canon G1010 driver on Windows)
-   renders the document into the printer's native format.
-2. **TCP send** — The driver sends the rendered bytes to the ESP32's IP address
-   on port `9100` (standard RAW/AppSocket protocol).
-3. **ESP32 Wi-Fi ingress** — A TCP server accepts the connection and reads
-   chunks into a 512 KB PSRAM-backed ring buffer.
-4. **Buffer drain task** — A dedicated FreeRTOS task on core 0 reads from the
-   ring buffer and writes to the USB printer's Bulk OUT endpoint. A pre-fill
-   gate accumulates ~64 KB before starting USB output so the printer gets a
-   steady stream despite Wi-Fi jitter.
-5. **USB printer** — Receives the raw byte stream and prints.
-
-### Internal Architecture
+## Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        ESP32-S3 Firmware                    │
-│                                                             │
-│  ┌─────────────┐    ┌──────────────────┐    ┌───────────┐  │
-│  │  Wi-Fi      │    │  Ring Buffer     │    │  USB Host │  │
-│  │  TCP Server ├───>│  (512KB PSRAM)   ├───>│  Printer  │  │
-│  │  port 9100  │    │                  │    │  Bridge   │  │
-│  └─────────────┘    │  mutex-guarded   │    └───────────┘  │
-│                     │  semaphore-      │                    │
-│  ┌─────────────┐    │  signaled        │    ┌───────────┐  │
-│  │  Debug      │    └──────────────────┘    │  RGB LED  │  │
-│  │  Console    │                            │  Status   │  │
-│  │  port 2323  │                            │  Feedback │  │
-│  └─────────────┘                            └───────────┘  │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │  FreeRTOS Tasks                                     │    │
-│  │  - main loop: TCP accept, read, LED, heartbeat      │    │
-│  │  - buf_drain (core 0): ring buffer -> USB OUT       │    │
-│  │  - usb_lib: USB host library event loop             │    │
-│  │  - usb_client: device attach/detach handling        │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
+Client --> TCP:9100 --> WiFi --> ring buffer (512KB PSRAM) --> drain task --> USB bulk OUT --> Printer
+Printer --> USB bulk IN --> recv task --> TCP:9100 --> Client
 ```
+
+Step by step:
+
+1. The printer driver on your computer renders the document into the printer's
+   native format.
+2. The driver sends the rendered bytes to the ESP32 on TCP port 9100.
+3. The ESP32 TCP server reads chunks into the PSRAM-backed ring buffer.
+4. A pre-fill gate accumulates ~64 KB before the drain task starts sending to
+   USB, so the printer gets a steady stream despite WiFi jitter.
+5. The drain task (core 0) reads from the ring buffer and writes to the USB
+   bulk OUT endpoint.
+6. The receive task (core 1) polls the printer's bulk IN endpoint and relays
+   any responses back to the TCP client.
 
 ## Hardware
 
-- **ESP32-S3-DevKitC-1 N16R8** (16 MB flash, 8 MB octal PSRAM)
+- **ESP32-S3-DevKitC-1 N16R8** -- 16 MB flash, 8 MB octal PSRAM
 - Any USB printer (Canon G1010, HP, Epson, Brother, etc.)
-- USB cable from ESP32-S3 host port to the printer
+- USB cable from the ESP32-S3 host port to the printer
 
-## First-Time Setup
+A custom board definition lives in `boards/esp32-s3-n16r8.json`, and the
+partition table (`partitions/default_16MB.csv`) provides dual OTA slots.
 
-### 1. Create the Wi-Fi configuration file
+## Quick Start
 
-The file `include/network_config.h` is **gitignored** so your Wi-Fi credentials
-stay out of version control. You must create it manually:
+**Zero-to-printing in three commands** (requires `make` and either PlatformIO
+or Docker):
 
 ```bash
-cat > include/network_config.h << 'EOF'
-#pragma once
-
-// --- Station mode (connect to your home/office Wi-Fi) ---
-#define WIFI_STA_SSID     "YourWiFiSSID"
-#define WIFI_STA_PASSWORD "YourWiFiPassword"
-
-// --- Fallback access point (if station fails or SSID is empty) ---
-#define WIFI_AP_SSID     "ESP32-Print-Bridge"
-#define WIFI_AP_PASSWORD "printbridge"
-
-// --- mDNS hostname (reachable as <hostname>.local) ---
-#define PRINTER_HOSTNAME "esp32-print-bridge"
-EOF
+git clone <repo-url> && cd usb_to_ip_printer
+make setup                         # creates include/network_config.h
+$EDITOR include/network_config.h   # set your Wi-Fi SSID/password
+make flash                         # compile + upload to connected ESP32-S3
+make monitor                       # watch it boot and connect
 ```
 
-Replace `YourWiFiSSID` and `YourWiFiPassword` with your actual credentials.
-If you leave `WIFI_STA_SSID` empty (`""`), the firmware will skip station mode
-and start the fallback access point instead.
+`make help` shows all available targets. `make doctor` checks your environment
+and lists available USB serial ports.
 
-### 2. Build and flash
+## Setup (detailed)
 
-1. Open this folder in Visual Studio Code with the PlatformIO extension.
-2. Build with PlatformIO (`pio run`).
-3. Upload to the ESP32-S3 (`pio run -t upload`).
-4. Open the serial monitor at `115200` baud.
-5. Note the printed IP address, or connect to the fallback AP.
+### 1. Wi-Fi configuration
 
-### 3. Wire the USB printer
+`make setup` creates `include/network_config.h` from the template. The file is
+gitignored so credentials never enter version control. Open it and set:
 
-The ESP32-S3 must be wired in **USB host mode** to the printer — this is
+| Macro              | Purpose                                                     |
+|--------------------|-------------------------------------------------------------|
+| `WIFI_STA_SSID`    | Your Wi-Fi SSID. Leave empty `""` to skip STA mode.         |
+| `WIFI_STA_PASSWORD`| Wi-Fi password.                                             |
+| `WIFI_AP_SSID`     | Fallback AP name (used when STA connect fails).             |
+| `WIFI_AP_PASSWORD` | Fallback AP password.                                       |
+| `PRINTER_HOSTNAME` | mDNS name; reachable as `<hostname>.local`.                 |
+
+### 2. Wire the USB printer
+
+The ESP32-S3 must be wired in **USB host mode** to the printer -- this is
 separate from the UART/USB bridge used for serial monitor and flashing.
 
-- USB D+ and D- from the ESP32-S3 host-capable pins go to the printer
+- Connect USB D+ and D- from the ESP32-S3 host-capable pins to the printer
 - The printer side must see valid VBUS power
 - The printer should be self-powered or externally powered
 
-### 4. Add the printer on your computer
+## Building and Flashing
 
-The ESP32 speaks standard RAW/AppSocket on port `9100`. Your OS's printer driver
-does all the rendering — the ESP32 is a transparent byte pipe. Follow the
-instructions for your platform below.
+### Make workflow (recommended)
+
+| Command          | Purpose                                                      |
+|------------------|--------------------------------------------------------------|
+| `make setup`     | Create `include/network_config.h` from template (one time)   |
+| `make build`     | Compile firmware                                             |
+| `make flash`     | Compile + flash to connected ESP32-S3                        |
+| `make monitor`   | Open serial monitor (115200 baud)                            |
+| `make dev`       | Flash then open monitor (typical edit-flash-debug loop)      |
+| `make test`      | Run native unit tests                                        |
+| `make ports`     | List attached USB serial devices                             |
+| `make doctor`    | Check environment for required tools                         |
+| `make clean`     | Remove build artefacts                                       |
+
+The Makefile auto-detects whether to use a local PlatformIO install or Docker.
+Force Docker with `make build USE_DOCKER=1`. Flashing always uses a local
+PlatformIO install because Docker cannot reliably forward USB on macOS.
+
+### Docker-only (no local PlatformIO required)
+
+| Command              | Purpose                                              |
+|----------------------|------------------------------------------------------|
+| `make docker-image`  | Build both Docker images (one time, ~5 min cold)     |
+| `make docker-build`  | Compile firmware inside the container                |
+| `make docker-test`   | Run native tests inside the container                |
+
+The build image caches the ESP32-S3 toolchain inside the image, so subsequent
+`docker-build` runs are fast. The generated `firmware.bin` lands on the host
+at `.pio/build/esp32-s3-n16r8/firmware.bin`. Flash it with any tool that can
+talk to the ESP32-S3 bootloader (e.g. `esptool.py`), or run `make flash` once
+PlatformIO is installed locally.
+
+### Manual / advanced
+
+Plain PlatformIO still works:
+
+```bash
+pio run                          # build
+pio run -t upload                # flash
+pio device monitor               # serial monitor
+pio test -e native-tests         # tests
+```
+
+Note the printed IP address from the serial monitor, or connect to the
+fallback AP if station mode was not configured.
+
+### LED pin
+
+The onboard RGB LED defaults to `GPIO48` (ESP32-S3-DevKitC-1). If your board
+uses a different pin, change the build flag in `platformio.ini`:
+
+```ini
+build_flags =
+  -DRGB_LED_PIN=38
+```
+
+## Testing
+
+The ring buffer has a comprehensive test suite (70+ tests covering wrap
+boundaries, backpressure, data integrity, sentinel invariants, and more) that
+runs natively on the host -- no ESP32 hardware required.
+
+```bash
+make test                  # local or docker, whichever is available
+make docker-test           # always run in docker
+```
+
+## Usage
+
+### Printing
+
+The ESP32 speaks standard RAW/AppSocket on port 9100. Add it as a network
+printer and install the driver for your USB printer model.
 
 #### Windows
 
-1. Open **Settings > Bluetooth & devices > Printers & scanners**.
-2. Click **Add device**, then click **Add manually**.
-3. Select **Add a printer using a TCP/IP address or hostname**.
-4. Enter:
-   - **Hostname or IP address:** the ESP32's IP (from serial monitor, e.g. `192.168.1.42`)
-   - **Port name:** leave default or give it a name
-5. When prompted for device type, select **Custom** and click **Settings...**
-   - **Protocol:** Raw
-   - **Port Number:** `9100`
-6. Click **OK**, then **Next**.
-7. Install the driver for your USB printer model (e.g. Canon G1010). Use
-   **Have Disk** if you downloaded the driver separately.
-8. Print a test page to verify.
+1. **Settings > Bluetooth & devices > Printers & scanners > Add device > Add
+   manually**.
+2. Select **Add a printer using a TCP/IP address or hostname**.
+3. Enter the ESP32's IP address (or `esp32-print-bridge.local`).
+4. Protocol: **Raw**, Port: **9100**.
+5. Install the driver for your printer model (e.g. Canon G1010).
 
 #### macOS
 
-1. Open **System Settings > Printers & Scanners** (or **System Preferences > Printers & Scanners** on older macOS).
-2. Click the **+** button to add a printer.
-3. Select the **IP** tab.
-4. Enter:
-   - **Address:** the ESP32's IP (e.g. `192.168.1.42`)
-   - **Protocol:** HP Jetdirect - Socket
-   - **Queue:** leave empty
-   - **Name:** anything you like (e.g. `USB Print Bridge`)
-5. For **Use / Driver**, choose **Select Software...** and pick your printer
-   model, or click **Other...** to load a PPD file from the manufacturer.
-6. Click **Add**, then print a test page to verify.
-
-> **Tip:** If the ESP32 is advertising mDNS, you can also use
-> `esp32-print-bridge.local` as the address instead of the IP.
+1. **System Settings > Printers & Scanners > +** (IP tab).
+2. Address: ESP32's IP (or `esp32-print-bridge.local`).
+3. Protocol: **HP Jetdirect - Socket**.
+4. Select the appropriate driver or PPD.
 
 #### Linux (CUPS)
 
-1. Open a browser and go to the CUPS web interface at `http://localhost:631`.
-2. Click **Administration > Add Printer**.
-3. Under **Other Network Printers**, select **AppSocket/HP JetDirect**.
-4. Enter the connection URI:
-   ```
-   socket://192.168.1.42:9100
-   ```
-   (replace with the ESP32's actual IP)
-5. Give the printer a name and description.
-6. Select the driver/PPD for your printer model. If your printer is not listed,
-   download the PPD from the manufacturer and upload it.
-7. Click **Add Printer**, set default options, then print a test page.
-
-Alternatively, add it from the command line:
-
 ```bash
-# Using CUPS lpadmin (replace IP, name, and PPD path)
 lpadmin -p "USB-Print-Bridge" \
   -v "socket://192.168.1.42:9100" \
   -P /path/to/your-printer.ppd \
   -E
-
-# Print a test page
-lp -d "USB-Print-Bridge" /usr/share/cups/data/testprint
 ```
 
-## Network Modes
+A Canon G1010 PPD file (`CanonIJG1000series.ppd.gz`) is included in the repo
+for CUPS integration.
 
-The firmware tries Wi-Fi **station mode** first using the credentials in
-`include/network_config.h`.
+### Quick test with netcat
 
-If `WIFI_STA_SSID` is left empty, it starts its own **access point**:
+```bash
+# Send a raw file
+nc <esp32-ip> 9100 < test-print.bin
 
-| Setting  | Value                        |
-|----------|------------------------------|
-| SSID     | `ESP32-Print-Bridge`         |
-| Password | `printbridge`                |
-| Hostname | `esp32-print-bridge.local`   |
+# Text smoke test
+printf "test page\n" | nc <esp32-ip> 9100
+```
+
+### Debug console
+
+Connect to port 2323 with telnet or netcat:
+
+```bash
+nc <esp32-ip> 2323
+```
+
+Available commands:
+
+| Command  | Description                                |
+|----------|--------------------------------------------|
+| `status` | Full bridge status (network, USB, job, buffer, heap) |
+| `usb`    | USB counters, endpoints, last error        |
+| `job`    | Current job byte/chunk counters            |
+| `buf`    | Ring buffer usage and drain state          |
+| `heap`   | Free heap, uptime, boot count, reset reason |
+| `help`   | List all commands                          |
+| `close`  | Close the debug session                    |
+
+## Architecture
+
+```
++-------------------------------------------------------------+
+|                     ESP32-S3 Firmware                        |
+|                                                              |
+|  +-----------+    +------------------+    +---------------+  |
+|  | WiFi      |    | Ring Buffer      |    | USB Host      |  |
+|  | TCP Server|--->| (512KB PSRAM)    |--->| Printer       |  |
+|  | port 9100 |    |                  |    | Bridge        |  |
+|  +-----------+    | mutex-guarded    |    +-------+-------+  |
+|                   | semaphore-       |            |          |
+|  +-----------+    | signaled         |    +-------+-------+  |
+|  | Debug     |    +------------------+    | USB bulk IN   |  |
+|  | Console   |                            | recv task     |--+--> TCP:9100
+|  | port 2323 |                            +---------------+  |
+|  +-----------+    +---------------+                          |
+|                   | NeoPixel LED  |                          |
+|                   | State Machine |                          |
+|                   +---------------+                          |
+|                                                              |
+|  FreeRTOS Tasks:                                             |
+|   - main loop  : TCP accept, read, LED, heartbeat           |
+|   - buf_drain  : ring buffer -> USB OUT          (core 0)   |
+|   - usb_recv   : USB IN -> TCP client            (core 1)   |
+|   - usb_lib    : USB host library event loop                |
+|   - usb_client : device attach/detach handling              |
++-------------------------------------------------------------+
+```
+
+### Ports
+
+| Port | Protocol | Purpose                    |
+|------|----------|----------------------------|
+| 9100 | TCP      | RAW print data (bidirectional) |
+| 2323 | TCP      | Debug console (telnet)     |
+
+### Network modes
+
+The firmware tries WiFi station mode first. If `WIFI_STA_SSID` is empty, it
+starts its own access point:
+
+| Setting  | Default value              |
+|----------|----------------------------|
+| SSID     | `ESP32-Print-Bridge`       |
+| Password | `printbridge`              |
+| Hostname | `esp32-print-bridge.local` |
 
 ## LED Status Guide
 
-| Color / Pattern          | Meaning                     |
-|--------------------------|-----------------------------|
-| White (solid)            | Booting                     |
-| Blue (blinking)          | Connecting to Wi-Fi         |
-| Purple (blinking)        | Access point ready           |
-| Orange (blinking)        | Waiting for USB printer      |
-| Green (solid)            | Ready for print jobs         |
-| Cyan (solid)             | Client connected             |
-| Yellow (fast blink)      | Receiving / printing data    |
-| Green (fast blink)       | Job completed                |
-| Red (fast blink)         | Error                        |
-
-## Debug Console
-
-A TCP debug console is available on port `2323`. Connect with:
-
-```bash
-nc <esp-ip-address> 2323
-```
-
-Commands: `status`, `usb`, `job`, `buf`, `heap`, `help`, `close`.
-
-## Validate RAW Port 9100
-
-Send a test file to the RAW socket:
-
-```bash
-nc <esp-ip-address> 9100 < test-print.bin
-```
-
-Or a text smoke test:
-
-```bash
-printf "test page\n" | nc <esp-ip-address> 9100
-```
-
-The serial monitor will log connection and byte-count information while the LED
-turns yellow during the transfer.
-
-> **Note:** Smoke tests validate the network path. For a full print validation,
-> send a real job through your printer driver (e.g. print a test page from
-> Windows with the Canon G1010 driver pointed at the ESP32's IP).
-
-## LED Pin
-
-The onboard RGB LED defaults to `GPIO48` (ESP32-S3-DevKitC-1). If your LED does
-not work, change the build flag in `platformio.ini`:
-
-```ini
-build_flags = -DRGB_LED_PIN=38
-```
+| Color / Pattern       | State              | Meaning                      |
+|-----------------------|--------------------|------------------------------|
+| White (solid)         | Booting            | Firmware initializing        |
+| Blue (blinking)       | WifiConnecting     | Connecting to WiFi station   |
+| Purple (blinking)     | AccessPointReady   | AP mode active, waiting      |
+| Orange (blinking)     | WaitingForPrinter  | WiFi up, no USB printer yet  |
+| Green (solid)         | Ready              | Ready for print jobs         |
+| Cyan (solid)          | ClientConnected    | TCP client connected         |
+| Yellow (fast blink)   | Printing           | Receiving/printing data      |
+| Green (fast blink)    | JobComplete        | Job finished successfully    |
+| Red (fast blink)      | Error              | USB or system error          |
 
 ## Project Structure
 
 ```
+boards/
+  esp32-s3-n16r8.json        # Custom board definition (16MB flash, 8MB PSRAM)
 include/
-  network_config.h      # Wi-Fi credentials (gitignored, create manually)
-  ring_buffer.h         # Lock-free ring buffer core
-  usb_printer_bridge.h  # USB host printer bridge API
+  network_config.h            # WiFi credentials (gitignored, create manually)
+  ring_buffer.h               # Header-only lock-free ring buffer
+  usb_printer_bridge.h        # USB host printer bridge API
 src/
-  main.cpp              # Wi-Fi, TCP server, LED, print job orchestration
-  usb_printer_bridge.cpp# USB host enumeration, endpoint claim, data transfer
+  main.cpp                    # WiFi, TCP servers, LED, state machine, FreeRTOS tasks
+  usb_printer_bridge.cpp      # USB host driver (ESP-IDF USB Host Library)
+test/
+  test_ring_buffer/
+    test_main.cpp             # Native unit tests for ring buffer (35+ tests)
 partitions/
-  default_16MB.csv      # Custom partition table for 16MB flash
-platformio.ini          # PlatformIO build configuration
+  default_16MB.csv            # Partition table with dual OTA slots
+Dockerfile                    # Containerized native test runner
+docker-compose.yml            # Docker Compose service for tests
+CanonIJG1000series.ppd.gz     # Canon G1010 PPD for CUPS
+platformio.ini                # Build configuration (esp32-s3-n16r8 + native-tests)
 ```

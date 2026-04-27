@@ -38,7 +38,8 @@ constexpr size_t kDebugBytesPerPoll = 64;
 constexpr size_t kPrintBufferCapacity = 512 * 1024;  // 512KB read-ahead buffer (PSRAM)
 constexpr size_t kHeapFallbackCapacity = 32 * 1024;   // conservative heap-only fallback
 constexpr size_t kHeapReserveBytes = 64 * 1024;       // minimum free heap to preserve
-constexpr uint32_t kBufferFlushTimeoutMs = 30000;
+constexpr uint32_t kBufferFlushTimeoutMs = 10000;
+constexpr uint32_t kRecvQuiesceTimeoutMs = 250;
 constexpr size_t kPrefillBytes = 64 * 1024;           // pre-fill before USB drain starts
 constexpr uint32_t kPrefillTimeoutMs = 2000;           // max wait for pre-fill
 
@@ -67,11 +68,14 @@ struct PrintRingBuffer {
   SemaphoreHandle_t mutex = nullptr;
   SemaphoreHandle_t data_ready = nullptr;
   TaskHandle_t drain_task = nullptr;
+  TaskHandle_t recv_task = nullptr;
   volatile bool drain_error = false;
   volatile bool job_active = false;
   volatile uint32_t job_generation = 0;
   volatile bool prefill_done = false;
   volatile uint32_t prefill_start_ms = 0;
+  volatile bool recv_active = false;  // gates usbRecvTask access to activeClient
+  volatile bool recv_in_flight = false;  // set while recv task is inside activeClient.write()
 } printBuf;
 
 // Static TCP read buffer — avoids 4KB stack allocations in the main loop
@@ -408,9 +412,42 @@ void printBufferDrainTask(void *) {
   }
 }
 
+void usbRecvTask(void *) {
+  uint8_t buf[512];
+  for (;;) {
+    // Only run when the main loop has explicitly activated recv for this job.
+    // recv_active is set in beginJob() and cleared in finishJob() before
+    // activeClient is touched, avoiding race conditions with the main loop.
+    if (!printBuf.recv_active || printBuf.drain_error) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    const int n = usb_printer_bridge::recv_raw(buf, sizeof(buf), 100);
+    if (n > 0) {
+      // Guard the activeClient.write with a pair of flags: recv_active is the
+      // permission gate, recv_in_flight tells finishJob() to wait for us to
+      // exit before it touches activeClient.  The order matters:
+      // re-check recv_active AFTER asserting in_flight, so finishJob() either
+      // sees in_flight=true (and waits) or sees in_flight=false after we've
+      // already bailed out — never a stale activeClient from mid-write.
+      printBuf.recv_in_flight = true;
+      if (printBuf.recv_active) {
+        activeClient.write(buf, static_cast<size_t>(n));
+      }
+      printBuf.recv_in_flight = false;
+    } else if (n < 0) {
+      // recv_raw returned an error (device gone, no IN endpoint, etc.).
+      // Avoid busy-spinning — pause before retrying.
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+}
+
 void flushPrintBuffer() {
   printBuf.prefill_done = true;  // force drain even if below watermark
   const uint32_t start = millis();
+  size_t last_logged_remaining = 0;
   while (millis() - start < kBufferFlushTimeoutMs) {
     if (printBuf.drain_error) {
       break;
@@ -420,6 +457,27 @@ void flushPrintBuffer() {
       break;
     }
     xSemaphoreGive(printBuf.data_ready);
+
+    // Keep the LED alive and reject stray clients while we wait.  The main
+    // loop is blocked here, so without this the device appears frozen for
+    // the full flush window if the USB side stalls.
+    updateLed();
+    WiFiClient extra = printServer.available();
+    if (extra) {
+      extra.println("BUSY");
+      extra.stop();
+    }
+
+    // Periodic progress log so a stuck flush is visible in the monitor.
+    if (millis() - start > 2000 &&
+        (last_logged_remaining == 0 ||
+         (last_logged_remaining > remaining &&
+          last_logged_remaining - remaining >= 16 * 1024))) {
+      Serial.printf("[BUFFER] Flushing... %u bytes remaining\n",
+                    static_cast<unsigned>(remaining));
+      last_logged_remaining = remaining;
+    }
+
     delay(10);
   }
   const size_t leftover = bufferUsed();
@@ -433,6 +491,7 @@ void beginJob(WiFiClient &client) {
   bufferReset();
   printBuf.job_generation++;
   printBuf.job_active = true;
+  printBuf.recv_active = true;
   printBuf.prefill_done = false;
   printBuf.prefill_start_ms = millis();
 
@@ -456,7 +515,23 @@ void finishJob(const char *reason, bool markComplete = true) {
   if (markComplete && !printBuf.drain_error) {
     flushPrintBuffer();
   }
+  // Stop the recv task before touching activeClient — recv_active gates all
+  // activeClient access from the recv task, preventing races with the main loop.
+  printBuf.recv_active = false;
   printBuf.job_active = false;
+  // Wait for the recv task to exit any in-progress activeClient.write().
+  // A fixed delay isn't enough: the task may be mid-write when recv_active
+  // is cleared, and activeClient.stop() racing with write() has previously
+  // corrupted WiFiClient state.  recv_in_flight is set around the write()
+  // call, so this loop observes a true→false transition deterministically.
+  const uint32_t quiesce_start = millis();
+  while (printBuf.recv_in_flight &&
+         millis() - quiesce_start < kRecvQuiesceTimeoutMs) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  if (printBuf.recv_in_flight) {
+    Serial.println("[JOB] recv task did not quiesce in time; proceeding anyway");
+  }
   bufferReset();
 
   const uint32_t elapsed = millis() - jobStats.startedAtMs;
@@ -524,8 +599,8 @@ void processPrintStream() {
     Serial.printf("[ERROR] Buffer drain failed: %s\n",
                   usb_printer_bridge::last_error());
     setState(DeviceState::Error);
-    activeClient.stop();
     finishJob("buffer drain failed", false);
+    activeClient.stop();
     return;
   }
 
@@ -757,7 +832,8 @@ void handleDebugCommand(WiFiClient &client, const char *rawCommand) {
   char command[kDebugCommandMax] = {0};
   size_t length = 0;
   while (rawCommand[length] != '\0' && length + 1 < sizeof(command)) {
-    command[length] = static_cast<char>(tolower(rawCommand[length]));
+    command[length] = static_cast<char>(
+        tolower(static_cast<unsigned char>(rawCommand[length])));
     length += 1;
   }
   command[length] = '\0';
@@ -978,6 +1054,12 @@ void setup() {
     Serial.println("[ERROR] Buffer drain task creation failed");
     setState(DeviceState::Error);
     return;
+  }
+
+  xTaskCreatePinnedToCore(usbRecvTask, "usb_recv", 4096, nullptr, 8,
+                          &printBuf.recv_task, 1);
+  if (printBuf.recv_task == nullptr) {
+    Serial.println("[WARN] USB receive task creation failed (bidirectional disabled)");
   }
 
   startPrintServer();

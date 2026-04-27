@@ -19,6 +19,7 @@ namespace {
 constexpr uint8_t kPrinterClassCode = USB_CLASS_PRINTER;
 constexpr bool kAllowDryRunWithoutPrinter = false;
 constexpr size_t kTransferBufferSize = 1024;
+constexpr size_t kInTransferBufferSize = 1024;
 constexpr TickType_t kTransferTimeoutTicks = pdMS_TO_TICKS(15000);
 
 struct BridgeState {
@@ -32,6 +33,12 @@ struct BridgeState {
   usb_host_client_handle_t client_hdl = nullptr;
   usb_device_handle_t device_hdl = nullptr;
   usb_transfer_t *out_transfer = nullptr;
+  usb_transfer_t *in_transfer = nullptr;
+  SemaphoreHandle_t in_transfer_done = nullptr;
+  SemaphoreHandle_t in_mutex = nullptr;
+  volatile bool in_transfer_in_flight = false;
+  usb_transfer_status_t last_in_transfer_status = USB_TRANSFER_STATUS_COMPLETED;
+  int last_in_actual_num_bytes = 0;
 
   bool host_running = false;
   bool client_registered = false;
@@ -58,7 +65,7 @@ struct BridgeState {
 
   usb_transfer_status_t last_transfer_status = USB_TRANSFER_STATUS_COMPLETED;
   int last_transfer_actual_num_bytes = 0;
-  bool transfer_in_flight = false;
+  volatile bool transfer_in_flight = false;
 
   char last_error[128] = "USB host not started";
 };
@@ -113,6 +120,18 @@ void transfer_callback(usb_transfer_t *transfer) {
   state->last_transfer_actual_num_bytes = transfer->actual_num_bytes;
   state->transfer_in_flight = false;
   xSemaphoreGive(state->transfer_done);
+}
+
+void in_transfer_callback(usb_transfer_t *transfer) {
+  auto *state = static_cast<BridgeState *>(transfer->context);
+  if (state == nullptr) {
+    return;
+  }
+
+  state->last_in_transfer_status = transfer->status;
+  state->last_in_actual_num_bytes = transfer->actual_num_bytes;
+  state->in_transfer_in_flight = false;
+  xSemaphoreGive(state->in_transfer_done);
 }
 
 void set_printer_ready_message_locked() {
@@ -251,12 +270,21 @@ bool inspect_interfaces(usb_device_handle_t device_hdl) {
   if (g_state.out_transfer == nullptr) {
     err = usb_host_transfer_alloc(kTransferBufferSize, 0, &g_state.out_transfer);
     if (err != ESP_OK || g_state.out_transfer == nullptr) {
-      Serial.printf("[USB] Failed to allocate transfer buffer: %s\n",
+      Serial.printf("[USB] Failed to allocate OUT transfer buffer: %s\n",
                     esp_err_to_name(err));
       usb_host_interface_release(g_state.client_hdl, device_hdl,
                                  selected_interface);
-      set_last_error("USB transfer alloc failed: %s", esp_err_to_name(err));
+      set_last_error("USB OUT transfer alloc failed: %s", esp_err_to_name(err));
       return false;
+    }
+  }
+
+  if (g_state.in_transfer == nullptr && selected_in != 0) {
+    err = usb_host_transfer_alloc(kInTransferBufferSize, 0, &g_state.in_transfer);
+    if (err != ESP_OK || g_state.in_transfer == nullptr) {
+      Serial.printf("[USB] Failed to allocate IN transfer buffer: %s (non-fatal)\n",
+                    esp_err_to_name(err));
+      g_state.in_transfer = nullptr;
     }
   }
 
@@ -294,7 +322,28 @@ void close_active_device() {
     return;
   }
 
-  if (g_state.printer_ready && g_state.interface_number != 0xff) {
+  // Mark printer as not ready so recv_raw() will bail out early and not
+  // submit new IN transfers while we're tearing down.
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  g_state.printer_ready = false;
+  xSemaphoreGive(g_state.state_mutex);
+
+  // Wait for any in-flight IN transfer to complete before releasing the
+  // interface and closing the device.  The transfer has a timeout set by
+  // the caller, so it will eventually complete or error out; we add a
+  // bounded wait here to avoid blocking indefinitely.
+  if (g_state.in_transfer_in_flight) {
+    Serial.println("[USB] Waiting for in-flight IN transfer to finish");
+    for (int i = 0; i < 20 && g_state.in_transfer_in_flight; ++i) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (g_state.in_transfer_in_flight) {
+      Serial.println("[USB] IN transfer still in flight after wait; proceeding with close");
+      g_state.in_transfer_in_flight = false;
+    }
+  }
+
+  if (g_state.interface_number != 0xff) {
     usb_host_interface_release(g_state.client_hdl, g_state.device_hdl,
                                g_state.interface_number);
   }
@@ -575,9 +624,12 @@ bool begin() {
   g_state.state_mutex = xSemaphoreCreateMutex();
   g_state.send_mutex = xSemaphoreCreateMutex();
   g_state.transfer_done = xSemaphoreCreateBinary();
+  g_state.in_mutex = xSemaphoreCreateMutex();
+  g_state.in_transfer_done = xSemaphoreCreateBinary();
 
   if (g_state.state_mutex == nullptr || g_state.send_mutex == nullptr ||
-      g_state.transfer_done == nullptr) {
+      g_state.transfer_done == nullptr || g_state.in_mutex == nullptr ||
+      g_state.in_transfer_done == nullptr) {
     set_last_error("Failed to create USB bridge synchronization primitives");
     return false;
   }
@@ -694,6 +746,87 @@ bool send_raw(const uint8_t *data, size_t length) {
   }
   xSemaphoreGive(g_state.send_mutex);
   return ok;
+}
+
+int recv_raw(uint8_t *data, size_t max_length, uint32_t timeout_ms) {
+  if (data == nullptr || max_length == 0) {
+    return -1;
+  }
+
+  if (!g_state.host_running || g_state.in_transfer == nullptr) {
+    return -1;
+  }
+
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  const bool ready = g_state.printer_ready;
+  const uint8_t in_ep_probe = g_state.in_endpoint;
+  usb_device_handle_t dev_hdl = g_state.device_hdl;
+  xSemaphoreGive(g_state.state_mutex);
+
+  if (!ready || in_ep_probe == 0 || dev_hdl == nullptr) {
+    return -1;
+  }
+
+  xSemaphoreTake(g_state.in_mutex, portMAX_DELAY);
+
+  // Double-check: the device may have disconnected (or been swapped) between
+  // releasing state_mutex and acquiring in_mutex.  close_active_device() sets
+  // printer_ready=false and waits for in-flight transfers, so re-checking
+  // under in_mutex prevents using a stale device handle or endpoint address
+  // that no longer belongs to the current device.
+  xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
+  if (!g_state.printer_ready || g_state.device_hdl == nullptr ||
+      g_state.in_endpoint == 0) {
+    xSemaphoreGive(g_state.state_mutex);
+    xSemaphoreGive(g_state.in_mutex);
+    return -1;
+  }
+  // Refresh dev_hdl and endpoint address from current state under lock
+  dev_hdl = g_state.device_hdl;
+  const uint8_t in_ep = g_state.in_endpoint;
+  xSemaphoreGive(g_state.state_mutex);
+
+  while (xSemaphoreTake(g_state.in_transfer_done, 0) == pdTRUE) {
+  }
+
+  usb_transfer_t *transfer = g_state.in_transfer;
+  transfer->device_handle = dev_hdl;
+  transfer->bEndpointAddress = in_ep;
+  transfer->num_bytes = static_cast<int>(
+      max_length < kInTransferBufferSize ? max_length : kInTransferBufferSize);
+  transfer->callback = in_transfer_callback;
+  transfer->context = &g_state;
+  transfer->timeout_ms = timeout_ms;
+  transfer->flags = 0;
+
+  g_state.in_transfer_in_flight = true;
+  esp_err_t err = usb_host_transfer_submit(transfer);
+  if (err != ESP_OK) {
+    g_state.in_transfer_in_flight = false;
+    xSemaphoreGive(g_state.in_mutex);
+    return -1;
+  }
+
+  TickType_t wait_ticks = pdMS_TO_TICKS(timeout_ms + 500);
+  if (xSemaphoreTake(g_state.in_transfer_done, wait_ticks) != pdTRUE) {
+    g_state.in_transfer_in_flight = false;
+    xSemaphoreGive(g_state.in_mutex);
+    return -1;
+  }
+
+  int result = -1;
+  if (g_state.last_in_transfer_status == USB_TRANSFER_STATUS_COMPLETED &&
+      g_state.last_in_actual_num_bytes > 0) {
+    const size_t n = static_cast<size_t>(g_state.last_in_actual_num_bytes);
+    const size_t copy_len = n < max_length ? n : max_length;
+    memcpy(data, transfer->data_buffer, copy_len);
+    result = static_cast<int>(copy_len);
+  } else if (g_state.last_in_transfer_status == USB_TRANSFER_STATUS_TIMED_OUT) {
+    result = 0;
+  }
+
+  xSemaphoreGive(g_state.in_mutex);
+  return result;
 }
 
 void get_status(UsbPrinterBridgeStatus *status) {
